@@ -134,12 +134,13 @@ pnpm test
 
 ### GitHub 上传范围
 
-- **只上传 `UI-TARS-desktop/` 这个 git 仓库**；仓库根是 `package.json`/`apps/`/`doc/`。
+- **只上传 CYRVIS 这个 git 仓库**（仓库内保留 `apps/`/`packages/`/`doc/` 结构；本地文件夹名可能仍叫 `UI-TARS-desktop`）。
 - 不要上传父目录 `CYRVIS/` 的 `dev-ui-tars.log`、`pnpm-install.log`、`.tmp-research/`、`Start-CYRVIS.cmd`（本地启动器）——日志里可能含模型配置/Key。
 - `apps/ui-tars/.env` 与 `%APPDATA%\ui-tars-desktop\ui_tars.setting.json` 都在仓库外/已忽略，**永远不要**复制进仓库。
-- `origin` 目前是 `gh-proxy.com` 代理地址；push 前改为真实 GitHub 地址（或使用可写的代理），例如：
+- 远端使用 SSH（直连 GitHub HTTPS 不通，SSH 已验证可用）：
   ```bash
-  git remote set-url origin https://github.com/<your-account>/UI-TARS-desktop.git
+  git remote set-url origin git@github.com:rain2create/CYRVIS.git
   git remote -v
   ```
-- 组员从同一仓库 fork/clone，按 `feat/*` 分支开发；文档与模块边界见 `roadmap.md`。
+  若仓库尚未改名，可先推旧地址（GitHub 改名后自动重定向），再更新 remote。
+- 组员从 `git@github.com:rain2create/CYRVIS.git` clone，按 `feat/*` 分支开发；文档与模块边界见 `roadmap.md`。

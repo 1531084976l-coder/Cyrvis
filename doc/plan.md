@@ -24,7 +24,7 @@
 
 ## 基座
 
-- 仓库：`rain2create/UI-TARS-desktop` fork
+- 仓库：`rain2create/CYRVIS`（基于 UI-TARS-desktop fork；GitHub 改名后旧地址会重定向）
 - 本地：`CYRVIS/UI-TARS-desktop`
 - 基线 commit：`3ac2cb8d946d78d5ff92ad17b318eaafa18c178c`（release 0.3.1）
 - 组件：Electron `apps/ui-tars` + `packages/ui-tars/sdk`（GUIAgent）+ nut-js operator

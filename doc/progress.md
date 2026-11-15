@@ -2,6 +2,7 @@
 
 ## 2026-11-15
 - [x] 仓库整理：CYRVIS 文档迁入 `doc/`，新增 `README.cyrvis.md`、`doc/README.md`、`doc/roadmap.md`、`doc/development.md`；原始产品愿景归档到 `doc/archive/product-vision-v1.md`。
+- [x] 首次提交 `641da6d8` 已推送到 GitHub `main`（SSH）；GitHub 仓库改名 `CYRVIS` 待网页操作/重定向。
 - [x] 清理：`mp3-player.ts` → `wav-player.ts`；删除未使用的 lamejs/lame-encoder/raw 类型与依赖；移除本地绝对路径；新增 `.env.example`、`scripts/cyrvis/start-dev.cmd`；`.gitignore` 补齐 secrets/logs/artifacts。
 - [x] 修复“多个 AI 同时说话/首中尾错位”：渲染端播放队列只允许在 underrun 时追平，禁止把领先 >2s 的队列重置到当前时间；用户确认“现在连贯”。
 - [x] 实现自然打断（barge-in）：助手播报时渲染端仍监听麦克风，连续 250ms 能量超过阈值即停止播放、取消 Qwen 响应、回灌最近 600ms 缓冲语音，用户无需按键。
