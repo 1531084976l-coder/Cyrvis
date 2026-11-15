@@ -13,3 +13,26 @@ scripts/merge-yml/*.yml
 .claude/
 .tarko
 .mcp*_token
+
+# Local secrets and logs (never commit)
+.env.*
+!.env.example
+!**/.env.example
+!.env.*.example
+*.pem
+*.key
+*.p12
+*.pfx
+logs/
+*.log*
+
+# Local artifacts / diagnostics
+.tmp*
+.tmp-*/
+.codex_*
+.pave-*
+*.wav
+*.pcm
+*.tar.gz
+*.zip
+*.7z

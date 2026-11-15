@@ -38,6 +38,9 @@ export function createWindow({
       preload: path.join(__dirname, '../preload/index.js'),
       sandbox: false,
       webSecurity: !!env.isDev,
+      // Keep microphone capture / audio playback alive when the window is
+      // hidden during a GUI task.
+      backgroundThrottling: false,
     },
   };
 

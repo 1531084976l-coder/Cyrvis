@@ -30,11 +30,33 @@ import { registerSettingsHandlers } from './services/settings';
 import { sanitizeState } from './utils/sanitizeState';
 import { windowManager } from './services/windowManager';
 import { checkBrowserAvailability } from './services/browserCheck';
+import { startVoiceService } from './cyrvis/voice-service';
 
 const { isProd } = env;
 
+// One instance only: multiple running instances each open a voice session and
+// would play the same assistant audio several times.
+if (!app.requestSingleInstanceLock()) {
+  app.quit();
+} else {
+  app.on('second-instance', () => {
+    const win = BrowserWindow.getAllWindows().find(
+      (item) => item.getTitle() === 'UI-TARS Desktop',
+    );
+    win?.show();
+    win?.focus();
+  });
+}
+
 // 在应用初始化之前启用辅助功能支持
 app.commandLine.appendSwitch('force-renderer-accessibility');
+// The voice assistant creates a fresh <audio> element for each TTS segment
+// outside a user gesture; without this Electron may reject play().
+app.commandLine.appendSwitch('autoplay-policy', 'no-user-gesture-required');
+
+if (env.isDev) {
+  app.commandLine.appendSwitch('remote-debugging-port', '9222');
+}
 
 // Handle creating/removing shortcuts on Windows when installing/uninstalling.
 if (squirrelStartup) {
@@ -114,7 +136,27 @@ const initializeApp = async () => {
 
   logger.info('mainZustandBridge');
 
+  if (env.isDev) {
+    mainWindow.webContents.on('console-message', (_event, _level, message) => {
+      if (message.includes('[cyrvis')) {
+        logger.info('[renderer]', message);
+      }
+    });
+  }
+
+  session.defaultSession.setPermissionRequestHandler(
+    (_webContents, permission, callback) => {
+      callback(permission === 'media');
+    },
+  );
+  session.defaultSession.setPermissionCheckHandler(
+    (_webContents, permission) => permission === 'media',
+  );
+
   const { unsubscribe } = registerIPCHandlers([mainWindow]);
+
+  // Voice layer is optional; it no-ops when QWEN_API_KEY is absent.
+  startVoiceService();
 
   app.on('window-all-closed', () => {
     logger.info('window-all-closed');

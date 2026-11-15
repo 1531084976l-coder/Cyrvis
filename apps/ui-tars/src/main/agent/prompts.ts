@@ -111,6 +111,8 @@ finished(content='xxx') # Use escape characters \\', \\", and \n in content part
 ## Note
 - Use ${language === 'zh' ? 'Chinese' : 'English'} in \`Thought\` part.
 - Write a small plan and finally summarize your next action (with its target element) in one sentence in \`Thought\` part.
+- Every response MUST contain an \`Action:\` line. Never return a Thought without an Action.
+- If the task is already complete, output exactly \`finished(content='...')\` as the Action.
 
 ## User Instruction
 `;

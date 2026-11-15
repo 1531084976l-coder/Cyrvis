@@ -2,7 +2,7 @@
  * Copyright (c) 2025 Bytedance, Inc. and its affiliates.
  * SPDX-License-Identifier: Apache-2.0
  */
-import { BrowserWindow } from 'electron';
+import { app, BrowserWindow } from 'electron';
 
 import { logger } from '@main/logger';
 import * as env from '@main/env';
@@ -10,6 +10,11 @@ import * as env from '@main/env';
 import { createWindow } from './createWindow';
 
 let mainWindow: BrowserWindow | null = null;
+let isQuitting = false;
+
+app.on('before-quit', () => {
+  isQuitting = true;
+});
 
 export function showInactive() {
   if (mainWindow) {
@@ -34,6 +39,11 @@ export function createMainWindow() {
 
   mainWindow.on('close', (event) => {
     logger.info('mainWindow closed');
+    if (isQuitting) {
+      mainWindow = null;
+      return;
+    }
+
     if (env.isMacOS) {
       event.preventDefault();
 
@@ -48,9 +58,18 @@ export function createMainWindow() {
       } else {
         mainWindow?.hide();
       }
-    } else {
-      mainWindow = null;
+      return;
     }
+
+    if (env.isWindows) {
+      // Keep the voice listener alive in the tray. Quit explicitly from the
+      // tray menu when the user really wants to stop CYRVIS.
+      event.preventDefault();
+      mainWindow?.hide();
+      return;
+    }
+
+    mainWindow = null;
   });
 
   return mainWindow;

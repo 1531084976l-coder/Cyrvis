@@ -1,3 +1,6 @@
+> **CYRVIS** — a voice-first desktop agent built on UI-TARS.
+> Start here: [README.cyrvis.md](./README.cyrvis.md) · Docs: [doc/](./doc/README.md)
+
 <picture>
   <img alt="Agent TARS Banner" src="./images/tars.png">
 </picture>

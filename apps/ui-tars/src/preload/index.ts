@@ -11,6 +11,25 @@ import type { AppState, LocalStore } from '@main/store/types';
 
 export type Channels = '';
 
+// Only one renderer callback may consume assistant audio. This prevents a
+// stale HMR mount (or an accidental second hook) from playing every chunk
+// twice, which sounds like two AIs talking at once.
+let activeAudioCallback: ((pcm16: Int16Array) => void) | null = null;
+let audioIpcAttached = false;
+let audioSubscriberCount = 0;
+
+const ensureAudioIpc = () => {
+  if (audioIpcAttached) {
+    return;
+  }
+  audioIpcAttached = true;
+  ipcRenderer.on('cyrvis:voice:audio', (_event, buffer: ArrayBuffer) => {
+    if (activeAudioCallback) {
+      activeAudioCallback(new Int16Array(buffer));
+    }
+  });
+};
+
 const electronHandler = {
   ipcRenderer: {
     invoke: (channel: string, ...args: unknown[]) =>
@@ -49,6 +68,170 @@ const electronHandler = {
     resetPreset: () => ipcRenderer.invoke('setting:resetPreset'),
     onUpdate: (callback: (setting: LocalStore) => void) => {
       ipcRenderer.on('setting-updated', (_, state) => callback(state));
+    },
+  },
+  voice: {
+    isTestMode: process.env.CYRVIS_VOICE_TEST === '1',
+    // Capture runs in a hidden renderer that never plays audio; the main
+    // renderer keeps playback only.
+    externalCapture: true,
+    onCaptureReady: (callback: (payload: { label: string }) => void) => {
+      const listener = (_event: IpcRendererEvent, payload: { label: string }) =>
+        callback(payload);
+      ipcRenderer.on('cyrvis:voice:capture-ready', listener);
+      return () =>
+        ipcRenderer.removeListener('cyrvis:voice:capture-ready', listener);
+    },
+    onCaptureError: (callback: (payload: { message: string }) => void) => {
+      const listener = (
+        _event: IpcRendererEvent,
+        payload: { message: string },
+      ) => callback(payload);
+      ipcRenderer.on('cyrvis:voice:capture-error', listener);
+      return () =>
+        ipcRenderer.removeListener('cyrvis:voice:capture-error', listener);
+    },
+    restartCapture: () => ipcRenderer.invoke('cyrvis:voice:restart-capture'),
+    setOutput: (label: string) =>
+      ipcRenderer.invoke('cyrvis:voice:set-output', label),
+    onSetOutput: (callback: (label: string) => void) => {
+      const listener = (_event: IpcRendererEvent, label: string) =>
+        callback(label);
+      ipcRenderer.on('cyrvis:voice:set-output', listener);
+      return () =>
+        ipcRenderer.removeListener('cyrvis:voice:set-output', listener);
+    },
+    setAudioMode: (mode: 'headset' | 'speaker') =>
+      ipcRenderer.invoke('cyrvis:voice:set-mode', mode),
+    getAudioMode: () => ipcRenderer.invoke('cyrvis:voice:get-mode'),
+    onAudioMode: (
+      callback: (payload: { mode: 'headset' | 'speaker' }) => void,
+    ) => {
+      const listener = (
+        _event: IpcRendererEvent,
+        payload: { mode: 'headset' | 'speaker' },
+      ) => callback(payload);
+      ipcRenderer.on('cyrvis:voice:audio-mode', listener);
+      return () =>
+        ipcRenderer.removeListener('cyrvis:voice:audio-mode', listener);
+    },
+    start: () => ipcRenderer.invoke('cyrvis:voice:start'),
+    testAudio: () => ipcRenderer.invoke('cyrvis:voice:test-audio'),
+    togglePtt: () => ipcRenderer.invoke('cyrvis:voice:toggle-ptt'),
+    getPtt: () => ipcRenderer.invoke('cyrvis:voice:get-ptt'),
+    onPttState: (
+      callback: (state: { active: boolean; mode: boolean }) => void,
+    ) => {
+      const listener = (
+        _event: IpcRendererEvent,
+        state: { active: boolean; mode: boolean },
+      ) => callback(state);
+      ipcRenderer.on('cyrvis:voice:ptt', listener);
+      return () => ipcRenderer.removeListener('cyrvis:voice:ptt', listener);
+    },
+    getState: () => ipcRenderer.invoke('cyrvis:voice:get-state'),
+    cancelTask: () => ipcRenderer.invoke('cyrvis:voice:cancel-task'),
+    sendAudio: (buffer: ArrayBuffer) =>
+      ipcRenderer.send('cyrvis:voice:audio', buffer),
+    notifyPlaybackIdle: () => ipcRenderer.send('cyrvis:voice:playback-idle'),
+    bargeIn: () => ipcRenderer.send('cyrvis:voice:barge-in'),
+    forceAwake: () => ipcRenderer.send('cyrvis:voice:force-awake'),
+    sleep: () => ipcRenderer.send('cyrvis:voice:sleep'),
+    onAudio: (callback: (pcm16: Int16Array) => void) => {
+      activeAudioCallback = callback;
+      audioSubscriberCount += 1;
+      ensureAudioIpc();
+      return () => {
+        audioSubscriberCount = Math.max(0, audioSubscriberCount - 1);
+        if (activeAudioCallback === callback) {
+          activeAudioCallback = null;
+        }
+      };
+    },
+    debugAudioSubscribers: () => ({
+      active: activeAudioCallback !== null,
+      total: audioSubscriberCount,
+    }),
+    onSpeechStarted: (callback: () => void) => {
+      const listener = () => callback();
+      ipcRenderer.on('cyrvis:voice:speech-started', listener);
+      return () =>
+        ipcRenderer.removeListener('cyrvis:voice:speech-started', listener);
+    },
+    onSpeechStopped: (callback: () => void) => {
+      const listener = () => callback();
+      ipcRenderer.on('cyrvis:voice:speech-stopped', listener);
+      return () =>
+        ipcRenderer.removeListener('cyrvis:voice:speech-stopped', listener);
+    },
+    onTranscript: (
+      callback: (payload: { text: string; final: boolean }) => void,
+    ) => {
+      const listener = (
+        _event: IpcRendererEvent,
+        payload: { text: string; final: boolean },
+      ) => callback(payload);
+      ipcRenderer.on('cyrvis:voice:transcript', listener);
+      return () =>
+        ipcRenderer.removeListener('cyrvis:voice:transcript', listener);
+    },
+    onAssistantText: (
+      callback: (payload: { text: string; final: boolean }) => void,
+    ) => {
+      const listener = (
+        _event: IpcRendererEvent,
+        payload: { text: string; final: boolean },
+      ) => callback(payload);
+      ipcRenderer.on('cyrvis:voice:assistant', listener);
+      return () =>
+        ipcRenderer.removeListener('cyrvis:voice:assistant', listener);
+    },
+    onState: (callback: (state: unknown) => void) => {
+      const listener = (_event: IpcRendererEvent, state: unknown) =>
+        callback(state);
+      ipcRenderer.on('cyrvis:voice:state', listener);
+      return () => ipcRenderer.removeListener('cyrvis:voice:state', listener);
+    },
+    onTaskEvent: (callback: (event: unknown) => void) => {
+      const listener = (_event: IpcRendererEvent, event: unknown) =>
+        callback(event);
+      ipcRenderer.on('cyrvis:voice:task-event', listener);
+      return () =>
+        ipcRenderer.removeListener('cyrvis:voice:task-event', listener);
+    },
+    onResponseStarted: (callback: () => void) => {
+      const listener = () => callback();
+      ipcRenderer.on('cyrvis:voice:response-started', listener);
+      return () =>
+        ipcRenderer.removeListener('cyrvis:voice:response-started', listener);
+    },
+    onResponseStopped: (callback: () => void) => {
+      const listener = () => callback();
+      ipcRenderer.on('cyrvis:voice:response-stopped', listener);
+      return () =>
+        ipcRenderer.removeListener('cyrvis:voice:response-stopped', listener);
+    },
+    onThinking: (callback: () => void) => {
+      const listener = () => callback();
+      ipcRenderer.on('cyrvis:voice:thinking', listener);
+      return () =>
+        ipcRenderer.removeListener('cyrvis:voice:thinking', listener);
+    },
+    onResponseDone: (callback: () => void) => {
+      const listener = () => callback();
+      ipcRenderer.on('cyrvis:voice:response-done', listener);
+      return () =>
+        ipcRenderer.removeListener('cyrvis:voice:response-done', listener);
+    },
+    onWake: (callback: () => void) => {
+      const listener = () => callback();
+      ipcRenderer.on('cyrvis:voice:wake', listener);
+      return () => ipcRenderer.removeListener('cyrvis:voice:wake', listener);
+    },
+    onSleep: (callback: () => void) => {
+      const listener = () => callback();
+      ipcRenderer.on('cyrvis:voice:sleep', listener);
+      return () => ipcRenderer.removeListener('cyrvis:voice:sleep', listener);
     },
   },
 };
