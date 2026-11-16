@@ -145,3 +145,4 @@
 - [x] 耳机模式恢复简单能量 barge（1000/150ms）：耳麦几乎无外放回声，不再走参考/探针流程，短“停”可直接打断。
 - [x] 改为确定性 barge stop：确认打断后不再把预录/打断语音送 ASR，直接 `provider.bargeIn()` + `muteMicFor(900)` + `brain.handleBargeStop()`；后者暂停正在执行的 GUI 任务并抑制 2 秒回复。这样“停/停一下”不依赖 ASR 是否听清，也不会延迟几秒后生成新回复。
 - [x] GUI Agent 从 ShowUI 切回 Ark：恢复 `%APPDATA%\ui-tars-desktop\ui_tars.setting.json` 的 `vlmBaseUrl=https://ark.cn-beijing.volces.com/api/plan/v3`、`vlmModelName=doubao-seed-2.1-lite`，保留新 `widgetOverlayMode`；Ark `/chat/completions` 实测 HTTP 200；App 内 `setting.getSetting()` 已确认加载该配置。ShowUI 侧车已停止。
+- [x] GUI 任务“点击找不到”定位：语音转写和 `start_gui_task('打开浏览器并搜索携程')` 都正确；GUI 模型返回 `left_double(start_box='[88 378]')`（空格分隔），action-parser 只按逗号切分，解析成 `start_box:'[0.088]'`、`start_coords:[]`，实际没有可点击坐标，随后重复同一动作。已支持 `[x y]`/`[x1 y1 x2 y2]` 空格格式，新增解析测试；action-parser 40/40 通过并重新构建。
