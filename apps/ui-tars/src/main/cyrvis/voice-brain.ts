@@ -88,6 +88,9 @@ export class VoiceBrain {
   private lastAssistantText = '';
   private lastAssistantAudioAt = 0;
   private suppressControlProactivityUntil = 0;
+  // After a bare "停/暂停", do not let the model speak an acknowledgment.
+  // The user expects the audio to stop, not a new reply confirming it.
+  private suppressReplyUntil = 0;
   private lastDeterministicControl: {
     kind: 'cancel' | 'pause';
     at: number;
@@ -179,6 +182,10 @@ export class VoiceBrain {
     this.wake();
   }
 
+  shouldSuppressReply(): boolean {
+    return Date.now() < this.suppressReplyUntil;
+  }
+
   sleep(): void {
     if (!this.awake) {
       return;
@@ -230,6 +237,9 @@ export class VoiceBrain {
       },
       onTranscript: (text, final) => this.handleTranscript(text, final),
       onAssistantText: (text, final) => {
+        if (this.shouldSuppressReply()) {
+          return;
+        }
         if (final && text.trim()) {
           this.lastAssistantText = text;
         }
@@ -246,11 +256,20 @@ export class VoiceBrain {
       onAudio: (pcm16) => {
         this.responseHadAudio = true;
         this.lastAssistantAudioAt = Date.now();
-        if (this.awake && !this.suppressAudioUntilResponseDone) {
+        if (
+          this.awake &&
+          !this.suppressAudioUntilResponseDone &&
+          !this.shouldSuppressReply()
+        ) {
           this.callbacks.onAudio?.(pcm16);
         }
       },
       onResponseStarted: () => {
+        if (this.shouldSuppressReply()) {
+          console.log('[cyrvis voice] suppressed reply after stop command');
+          this.provider.cancelResponse();
+          return;
+        }
         this.assistantTextBuffer = '';
         this.completionGuardTriggered = false;
         this.suppressAudioUntilResponseDone = false;
@@ -333,6 +352,15 @@ export class VoiceBrain {
     // call the tool (observed in real testing: it said "paused" but the GUI
     // agent kept running).
     const deterministicControl = this.handleDeterministicControl(text);
+    const bareStop =
+      /^(停|停止|停下|暂停|别说了|不要说了|stop|cancel)[。！!，,\s]*$/i.test(
+        text.trim(),
+      );
+    if (bareStop) {
+      // A bare stop should end playback, not trigger "好的，已暂停…" audio.
+      this.suppressReplyUntil = Date.now() + 2000;
+      this.provider.cancelResponse();
+    }
     if (deterministicControl) {
       // The tool-result response is the single acknowledgment. Suppress the
       // proactive "已暂停/已停止" line that would otherwise race it.

@@ -403,6 +403,27 @@ describe('VoiceBrain', () => {
     expect(provider.canceled).toBeGreaterThan(0);
   });
 
+  it('suppresses the model reply after a bare stop', async () => {
+    const { brain, provider, audioOut } = setup({ requireWakeWord: false });
+    await brain.start();
+
+    provider.callbacks.onResponseStarted?.();
+    provider.emitAudio(new Int16Array(320));
+    provider.emitTranscript('停', true);
+    await flush();
+
+    expect(provider.canceled).toBeGreaterThan(0);
+    expect(brain.shouldSuppressReply()).toBe(true);
+
+    const audioBefore = audioOut.length;
+    provider.callbacks.onResponseStarted?.();
+    provider.emitAudio(new Int16Array(320));
+    provider.callbacks.onAssistantText?.('好的，已暂停当前任务。', true);
+    await flush();
+
+    expect(audioOut.length).toBe(audioBefore);
+  });
+
   it('sleeps after the awake timeout', async () => {
     vi.useFakeTimers();
     const { brain, provider, wakeEvents } = setup({ awakeTimeoutMs: 1000 });

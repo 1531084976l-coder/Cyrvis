@@ -62,8 +62,10 @@ const pttMode = false;
 const CAPTURE_BARGE_THRESHOLD = 1000;
 const CAPTURE_BARGE_SUSTAIN_MS = 150;
 const SPEAKER_REVERB_GUARD_MS = 1400;
-const SPEAKER_PROBE_DECAY_MS = 220;
-const SPEAKER_PROBE_CONFIRM_MS = 140;
+// A bare "停" is often only 200-300ms. The old 220ms decay + 140ms confirm
+// discarded the whole word, so every short stop failed the probe.
+const SPEAKER_PROBE_DECAY_MS = 80;
+const SPEAKER_PROBE_CONFIRM_MS = 100;
 const SPEAKER_PROBE_TIMEOUT_MS = 700;
 const SPEAKER_PROBE_THRESHOLD = 1100;
 const SPEAKER_RESUME_SUPPRESS_MS = 550;
@@ -896,6 +898,11 @@ export const startVoiceService = (): VoiceService | null => {
           callbacks.onTranscript?.(text, final);
         },
         onResponseStarted: () => {
+          if (service?.brain.shouldSuppressReply()) {
+            logger.info('[cyrvis voice] suppress reply after stop command');
+            service.provider.cancelResponse();
+            return;
+          }
           speakerBargeStopPending = false;
           if (speakerBargeStopTimer) {
             clearTimeout(speakerBargeStopTimer);
