@@ -135,3 +135,4 @@
 - [x] 探针时序从 220ms decay + 140ms confirm 改为 80ms + 100ms，避免 200–300ms 的“停”被全部丢弃；外放探针现在能确认更短的口令。
 - [x] 修复 barge 后长语音丢失：日志显示 22:34:38 barge 成功后只捕获 200ms 就 commit，随后 22:34:39–42 用户继续说的长段（avg 1859/7087/4143）因 `awaitingResponse` 半双工被丢弃，22:35:01 只转写出 “Ok.”。已加 post-barge 静音窗口 1600ms，给用户继续说完的机会，避免 800ms 就把短停顿当成本轮结束。
 - [ ] 模型质量：Token Plan 只有 `qwen-audio-3.0-realtime-plus`；`qwen3.8-omni-flash-realtime` 在 Token Plan 返回 `Model not exist`。当前 ASR 误识别明显（Hello CYRVIS → Hello service，长段 → Ok.），要回到 qwen3.8 需要公共 DashScope 的付费/额度 Key。
+- [x] ASR 模型对比（Token Plan，同一段 3.8s 测试音频）：`fun-asr` 与 `qwen3-asr-flash-realtime` 转写完全一致：“Hello service，请给我背诵一首长诗。”；说明 “Hello CYRVIS → Hello service” 是声学/发音问题，不是 ASR 模型选择问题。Token Plan 无 `qwen3.8-omni-flash-realtime`（返回 Model not exist），只有 `qwen-audio-3.0-realtime-plus`；要回到 qwen3.8 需要公共 DashScope 付费/额度 Key。
