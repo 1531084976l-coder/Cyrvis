@@ -4,6 +4,11 @@ const MAX_REFERENCE_AGE_MS = 5000;
 const MAX_ECHO_DELAY_MS = 1800;
 const ECHO_DELAY_STEP_MS = 20;
 const MIN_REFERENCE_RMS = 80;
+// Real speaker/mic paths on this hardware correlate around 0.69-0.76 because
+// of room reverb and Bluetooth mic processing. 0.72 left those in the
+// "ambiguous" band, causing repeated 700ms probe pauses during every reply.
+const ECHO_CORRELATION = 0.65;
+const AMBIGUOUS_CORRELATION = 0.18;
 
 interface ReferenceSegment {
   samples: Float32Array;
@@ -172,12 +177,15 @@ export class SpeakerEchoDetector {
       referenceAverage: bestReferenceAverage,
       correlation: bestCorrelation,
       referenceActive,
-      likelyEcho: referenceActive && average > 0.012 && bestCorrelation >= 0.72,
+      likelyEcho:
+        referenceActive &&
+        average > 0.012 &&
+        bestCorrelation >= ECHO_CORRELATION,
       ambiguous:
         referenceActive &&
         average > 0.012 &&
-        bestCorrelation >= 0.18 &&
-        bestCorrelation < 0.72,
+        bestCorrelation >= AMBIGUOUS_CORRELATION &&
+        bestCorrelation < ECHO_CORRELATION,
     };
   }
 

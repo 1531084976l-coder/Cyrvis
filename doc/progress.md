@@ -124,3 +124,9 @@
 - [x] 在 `merge/pr-1` 上合并组员 PR #1（reference-aware echo gating + 浮动语音工作区 + 记忆）；保留 Token Plan 端点、15 秒输入缓冲清理、断线重连、耳机/外放显式按钮。
 - [x] 验证：node/web typecheck 通过；CYRVIS + shared 测试 75/75；wav-player/widgetOverlay/store 测试 9/9；`UI_TARS_APP_PRIVATE_KEY_BASE64=dummy pnpm --filter ui-tars-desktop build:dist` 通过。
 - [ ] 真机外放打断复测：合并后启动 App，切到外放时蓝牙耳机 `cc ultimate` 从 Windows 消失（只剩 ToDesk 虚拟麦），采集重试 3 次后停止；需重新连接耳机后测试，通过后再 push main。
+- [x] 修复合并后“耳机/外放都打断不了”：播放参考 PCM 之前是在 `audio.play()` 返回后按 `currentTime` 截取，实际只剩 206–4258 字节，主进程经常 `ref: 0` 并 fail-closed。改为**播放前发送完整 0.75s 参考**，只有暂停恢复才发送剩余段；实测参考恢复为 36000 字节。
+- [x] 外放串音相关性实测 0.69–0.76，原 `likelyEcho >= 0.72` 让大量片段落入 ambiguous，反复暂停 700ms 做无效探针；阈值调整为 0.65。
+- [x] 合成“停”音频从 Realtek 播放并注入麦克风：日志 `direct interrupt detected { avg: 7490, corr: 0.147 }` → `barge-in`，外放打断链路验证通过。
+- [x] 修复 barge 后误重连：cancel 竞态的服务端 error 被当成致命错误，导致每次打断后 `sleep`/重连；现只对 `input buffer exceeded`/session 失效重连，其他 error 仅记录。
+- [x] 重连后重新触发 `onReady` 并 `wake`，修复“耳机模式转写了但 asleep 忽略、无声音”。
+- [ ] 蓝牙耳机在多次重启/切模式后又从 Windows 消失，当前采集无法启动；重新连接后再做一次真人“停”复测。

@@ -91,7 +91,7 @@ export class WavStreamPlayer {
     this.paused = false;
     const audio = this.current;
     if (audio) {
-      void this.startAudio(audio).catch((error) => {
+      void this.startAudio(audio, true).catch((error) => {
         if (this.finished || this.current !== audio) {
           return;
         }
@@ -199,7 +199,7 @@ export class WavStreamPlayer {
       { once: true },
     );
 
-    void this.startAudio(audio).catch((error) => {
+    void this.startAudio(audio, false).catch((error) => {
       // A stop/next-response can revoke the URL while play() is pending;
       // that rejection is expected, not an audio failure.
       if (this.finished || this.current !== audio) {
@@ -211,7 +211,10 @@ export class WavStreamPlayer {
     });
   }
 
-  private async startAudio(audio: HTMLAudioElement): Promise<void> {
+  private async startAudio(
+    audio: HTMLAudioElement,
+    resumed = false,
+  ): Promise<void> {
     const sinkable = audio as HTMLAudioElement & {
       setSinkId?: (id: string) => Promise<void>;
     };
@@ -228,22 +231,21 @@ export class WavStreamPlayer {
         this.outputDeviceId?.slice(0, 8) ?? 'default',
         activeSink?.slice(0, 8) ?? 'unknown',
       );
+      // Publish the reference before awaiting play(). The play() promise can
+      // resolve long after the media starts, which previously produced tiny
+      // or missing reference segments and made the echo detector fail closed.
+      // A real pause/resume sends the remaining tail instead.
+      if (this.currentPcm16) {
+        const offset = resumed
+          ? Math.min(
+              this.currentPcm16.length,
+              Math.max(0, Math.floor(audio.currentTime * SAMPLE_RATE)),
+            )
+          : 0;
+        this.onSegmentStart?.(this.currentPcm16.subarray(offset));
+      }
       await audio.play();
     }
-
-    if (
-      this.paused ||
-      this.finished ||
-      this.current !== audio ||
-      !this.currentPcm16
-    ) {
-      return;
-    }
-    const offset = Math.min(
-      this.currentPcm16.length,
-      Math.max(0, Math.floor(audio.currentTime * SAMPLE_RATE)),
-    );
-    this.onSegmentStart?.(this.currentPcm16.subarray(offset));
   }
 
   private stopCurrent(): void {

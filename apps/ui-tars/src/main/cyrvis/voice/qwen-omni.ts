@@ -530,10 +530,12 @@ export class QwenOmniProvider implements VoiceProvider {
         this.reconnectAttempts = 0;
         if (!this.readyEmitted) {
           this.readyEmitted = true;
-          this.callbacks.onReady?.();
         } else {
           console.log('[cyrvis provider] reconnected');
         }
+        // A reconnect fires onClose, which puts VoiceBrain to sleep. Always
+        // re-emit ready so the hands-free session wakes up again.
+        this.callbacks.onReady?.();
         break;
       case 'input_audio_buffer.speech_started':
         this.callbacks.onSpeechStarted?.();
@@ -680,9 +682,18 @@ export class QwenOmniProvider implements VoiceProvider {
           this.callbacks.onError?.(new Error(message));
         }
         this.failConnect(new Error(message));
-        // A server-side error invalidates the session state (observed with the
-        // 30s input-buffer limit). Keeping the socket open makes every queued
-        // append fail and floods the log; reset the session instead.
+        // Only session-breaking errors justify dropping the socket. Cancel
+        // races (response_cancel_not_active, response already done) are
+        // expected after a barge-in; reconnecting on those made every
+        // interruption sleep the brain and lose the next reply.
+        const fatal =
+          /buffer exceeded|maximum duration|invalid_session|session.*(expired|closed)/i.test(
+            message,
+          );
+        if (!fatal) {
+          console.log('[cyrvis provider] non-fatal server error', message);
+          break;
+        }
         this.connected = false;
         this.localSpeechActive = false;
         this.bufferedAudioMs = 0;
