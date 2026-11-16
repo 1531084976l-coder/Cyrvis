@@ -99,23 +99,14 @@ export class NutJSOperator extends Operator {
     const startBoxStr = action_inputs?.start_box || '';
 
     logger.info('[NutjsOperator] execute', scaleFactor);
-    const parsedStart = parseBoxToScreenCoords({
+    // Treat start_box as normalized [0..1] against the captured screen. Do not
+    // use the parser's start_coords here: it applies the display scaleFactor a
+    // second time, which pushed y=0.98 to 1764 on a 1440px-tall screen.
+    const { x: startX, y: startY } = parseBoxToScreenCoords({
       boxStr: startBoxStr,
       screenWidth,
       screenHeight,
     });
-    // The action parser already converts normalized boxes to physical screen
-    // coordinates with the display scale factor. Recomputing from start_box
-    // here divided by scaleFactor twice (125% display clicked 20% off).
-    const startCoords = action_inputs?.start_coords;
-    const startX =
-      Array.isArray(startCoords) && startCoords.length === 2
-        ? startCoords[0]
-        : parsedStart.x;
-    const startY =
-      Array.isArray(startCoords) && startCoords.length === 2
-        ? startCoords[1]
-        : parsedStart.y;
 
     logger.info(`[NutjsOperator Position]: (${startX}, ${startY})`);
 
@@ -227,20 +218,11 @@ export class NutJSOperator extends Operator {
       case 'select': {
         // end_box
         if (action_inputs?.end_box) {
-          const parsedEnd = parseBoxToScreenCoords({
+          const { x: endX, y: endY } = parseBoxToScreenCoords({
             boxStr: action_inputs.end_box,
             screenWidth,
             screenHeight,
           });
-          const endCoords = action_inputs?.end_coords;
-          const endX =
-            Array.isArray(endCoords) && endCoords.length === 2
-              ? endCoords[0]
-              : parsedEnd.x;
-          const endY =
-            Array.isArray(endCoords) && endCoords.length === 2
-              ? endCoords[1]
-              : parsedEnd.y;
 
           if (startX && startY && endX && endY) {
             logger.info(

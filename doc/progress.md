@@ -148,3 +148,4 @@
 - [x] GUI 任务“点击找不到”定位：语音转写和 `start_gui_task('打开浏览器并搜索携程')` 都正确；GUI 模型返回 `left_double(start_box='[88 378]')`（空格分隔），action-parser 只按逗号切分，解析成 `start_box:'[0.088]'`、`start_coords:[]`，实际没有可点击坐标，随后重复同一动作。已支持 `[x y]`/`[x1 y1 x2 y2]` 空格格式，新增解析测试；action-parser 40/40 通过并重新构建。
 - [x] 修复 125% 缩放下点击偏移：parser 已把归一化框换算成 `start_coords`（含 scaleFactor），NutjsOperator 却又用 `start_box` + 物理分辨率重算，导致实际点击坐标被多除 1.25（`[291,675] → (233,540)`），Chrome 图标点空。Operator 现在优先使用 `start_coords` / `end_coords`，无坐标时才回退 parseBox；nut-js operator 已重新构建。
 - [x] 找回“昨天下午 Seed 2.1 很顺”的行为：昨天没有 Action Batching 提示词；后来加入后，模型把“点 X 关闭文件管理器 + 双击 Chrome”批成同一轮，第二条动作执行时窗口还没关，直接点错。已从 Doubao prompt 移除 Action Batching 段落，并在 GUIAgent 执行层默认只执行第一条动作（`CYRVIS_ACTION_BATCHING=1` 才允许批量）。SDK 测试 6/6 通过，SDK 已重新构建。
+- [x] 修正上一版坐标修复方向：parser 的 `start_coords` 已乘过 scaleFactor，NutJS 再优先使用它会把 `y=0.98` 变成 1764（屏幕高 1440），点到屏幕外；因此退回“以归一化 start_box 重新计算物理坐标”，不再使用 start_coords。任务栏 Edge 点击应落在 y≈1411。Action Batching 仍保持默认关闭。
