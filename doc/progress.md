@@ -149,3 +149,4 @@
 - [x] 修复 125% 缩放下点击偏移：parser 已把归一化框换算成 `start_coords`（含 scaleFactor），NutjsOperator 却又用 `start_box` + 物理分辨率重算，导致实际点击坐标被多除 1.25（`[291,675] → (233,540)`），Chrome 图标点空。Operator 现在优先使用 `start_coords` / `end_coords`，无坐标时才回退 parseBox；nut-js operator 已重新构建。
 - [x] 找回“昨天下午 Seed 2.1 很顺”的行为：昨天没有 Action Batching 提示词；后来加入后，模型把“点 X 关闭文件管理器 + 双击 Chrome”批成同一轮，第二条动作执行时窗口还没关，直接点错。已从 Doubao prompt 移除 Action Batching 段落，并在 GUIAgent 执行层默认只执行第一条动作（`CYRVIS_ACTION_BATCHING=1` 才允许批量）。SDK 测试 6/6 通过，SDK 已重新构建。
 - [x] 修正上一版坐标修复方向：parser 的 `start_coords` 已乘过 scaleFactor，NutJS 再优先使用它会把 `y=0.98` 变成 1764（屏幕高 1440），点到屏幕外；因此退回“以归一化 start_box 重新计算物理坐标”，不再使用 start_coords。任务栏 Edge 点击应落在 y≈1411。Action Batching 仍保持默认关闭。
+- [x] 速度调整：删除 prompt 里“finished 前核对截图”两行（软约束、Seed 常忽略、对速度无帮助）；`loopIntervalInMs` 1000→500，减少每步固定等待。GUI 仍为 Seed 2.1 Lite、单动作单截图、归一化 start_box 坐标。

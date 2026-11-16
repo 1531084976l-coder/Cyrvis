@@ -108,9 +108,6 @@ wait() #Sleep for 5s and take a screenshot to check for any changes.
 finished(content='xxx') # Use escape characters \\', \\", and \n in content part to ensure we can parse the content in normal python string format.
 
 
-Before calling \`finished(...)\`, verify the expected result in the LATEST screenshot.
-If the effect of the last batch is not visible, do not claim success; retry or report the failure.
-
 ## Note
 - Use ${language === 'zh' ? 'Chinese' : 'English'} in \`Thought\` part.
 - Write a small plan and finally summarize your next action (with its target element) in one sentence in \`Thought\` part.
