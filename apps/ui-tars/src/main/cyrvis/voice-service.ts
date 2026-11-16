@@ -151,6 +151,7 @@ let speakerResumeSuppressUntil = 0;
 let lastSpeakerDiagnosticAt = 0;
 let voiceprintPending = false;
 let lastVoiceprintAt = 0;
+let voiceprintResidual: Int16Array[] = [];
 const VOICEPRINT_COOLDOWN_MS = 600;
 let speakerBargeStopPending = false;
 let speakerBargeStopTimer: ReturnType<typeof setTimeout> | null = null;
@@ -170,6 +171,7 @@ const resetSpeakerDetection = (): void => {
   speakerCandidateMs = 0;
   headsetBargeMs = 0;
   speakerResumeSuppressUntil = 0;
+  voiceprintResidual = [];
 };
 
 const expectSpeakerBargeStop = (): void => {
@@ -307,7 +309,9 @@ const verifyVoiceprint = async (): Promise<boolean | null> => {
   if (!base) {
     return null;
   }
-  const chunks = capturePreroll.slice(-50);
+  const source =
+    voiceprintResidual.length > 0 ? voiceprintResidual : capturePreroll;
+  const chunks = source.slice(-50);
   const total = chunks.reduce((sum, chunk) => sum + chunk.length, 0);
   if (total < 9600) {
     return null;
@@ -356,6 +360,10 @@ const handleSpeakerPlaybackPcm = (
   }
 
   const analysis = speakerEchoDetector.analyze(pcm16, now);
+  voiceprintResidual.push(analysis.residual);
+  if (voiceprintResidual.length > 50) {
+    voiceprintResidual.shift();
+  }
   if (now - lastSpeakerDiagnosticAt >= 1000) {
     lastSpeakerDiagnosticAt = now;
     logger.info('[cyrvis speaker] echo analysis', {

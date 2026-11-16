@@ -22,6 +22,8 @@ export interface SpeakerEchoAnalysis {
   referenceActive: boolean;
   likelyEcho: boolean;
   ambiguous: boolean;
+  /** Microphone audio after subtracting the best-aligned playback reference. */
+  residual: Int16Array;
 }
 
 const toFloat = (input: Int16Array): Float32Array => {
@@ -136,12 +138,14 @@ export class SpeakerEchoDetector {
         referenceActive: false,
         likelyEcho: false,
         ambiguous: false,
+        residual: microphone16k.slice(),
       };
     }
 
     this.prune(now);
     let bestCorrelation = 0;
     let bestReferenceAverage = 0;
+    let bestReference: Float32Array | null = null;
 
     for (const segment of this.references) {
       for (
@@ -167,11 +171,35 @@ export class SpeakerEchoDetector {
         if (score > bestCorrelation) {
           bestCorrelation = score;
           bestReferenceAverage = averageAbsolute(reference);
+          bestReference = reference;
         }
       }
     }
 
     const referenceActive = bestReferenceAverage > 0;
+    const residual = new Int16Array(microphone.length);
+    if (bestReference && bestCorrelation > 0.05) {
+      // Least-squares echo subtraction for the aligned 20ms window. This is a
+      // coarse single-tap canceller, not full AEC, but it removes enough of
+      // the assistant's voice for speaker verification to see the user.
+      let dot = 0;
+      let energy = 0;
+      for (let index = 0; index < microphone.length; index += 1) {
+        dot += microphone[index] * bestReference[index];
+        energy += bestReference[index] * bestReference[index];
+      }
+      const gain = energy > 1e-9 ? dot / energy : 0;
+      for (let index = 0; index < microphone.length; index += 1) {
+        const value = microphone[index] - gain * bestReference[index];
+        residual[index] = Math.max(
+          -32768,
+          Math.min(32767, Math.round(value * 0x8000)),
+        );
+      }
+    } else {
+      residual.set(microphone16k);
+    }
+
     return {
       average,
       referenceAverage: bestReferenceAverage,
@@ -186,6 +214,7 @@ export class SpeakerEchoDetector {
         average > 0.012 &&
         bestCorrelation >= AMBIGUOUS_CORRELATION &&
         bestCorrelation < ECHO_CORRELATION,
+      residual,
     };
   }
 
