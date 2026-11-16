@@ -332,7 +332,9 @@ export class VoiceBrain {
 
     if (!text.trim()) {
       // Qwen sometimes commits silence/noise and still generates a reply.
-      // Cancel it instead of stacking another assistant voice.
+      // Treat it like a stop for a short window; an unrecognized "停" often
+      // arrives here as an empty transcript and must not produce "好的，请问…".
+      this.markUserStop();
       this.provider.cancelResponse();
       return;
     }
