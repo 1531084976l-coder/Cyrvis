@@ -137,3 +137,6 @@
 - [ ] 模型质量：Token Plan 只有 `qwen-audio-3.0-realtime-plus`；`qwen3.8-omni-flash-realtime` 在 Token Plan 返回 `Model not exist`。当前 ASR 误识别明显（Hello CYRVIS → Hello service，长段 → Ok.），要回到 qwen3.8 需要公共 DashScope 的付费/额度 Key。
 - [x] ASR 模型对比（Token Plan，同一段 3.8s 测试音频）：`fun-asr` 与 `qwen3-asr-flash-realtime` 转写完全一致：“Hello service，请给我背诵一首长诗。”；说明 “Hello CYRVIS → Hello service” 是声学/发音问题，不是 ASR 模型选择问题。Token Plan 无 `qwen3.8-omni-flash-realtime`（返回 Model not exist），只有 `qwen-audio-3.0-realtime-plus`；要回到 qwen3.8 需要公共 DashScope 付费/额度 Key。
 - [x] 长语音被 8 秒硬切：`trackLocalVad` 在连续说话 8s 时强制 commit，随后 `awaitingResponse` 丢掉后半段；改为 25s 安全阈值，正常由 800ms（barge 后 1600ms）静音端点决定。
+- [x] 外放误打断：speaker 模式探针恢复 220ms decay / 140ms confirm，避免把扬声器混响尾音确认成人声；headset 模式仍用 80/100ms 以识别短“停”。
+- [x] “停一下”未匹配：bare-stop 正则补充 `停一下/停一停/先停/先停一下`。
+- [x] 任何确认的 barge 都调用 `markUserStop()`：取消当前响应并静音模型 2 秒，不再依赖 ASR 一定听清“停”；ASR 返回空/误识别也不会再生成“好的，请问…”的确认语。

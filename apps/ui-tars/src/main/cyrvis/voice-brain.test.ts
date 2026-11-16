@@ -409,7 +409,7 @@ describe('VoiceBrain', () => {
 
     provider.callbacks.onResponseStarted?.();
     provider.emitAudio(new Int16Array(320));
-    provider.emitTranscript('停', true);
+    provider.emitTranscript('停一下', true);
     await flush();
 
     expect(provider.canceled).toBeGreaterThan(0);

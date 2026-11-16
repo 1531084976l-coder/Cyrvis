@@ -186,6 +186,15 @@ export class VoiceBrain {
     return Date.now() < this.suppressReplyUntil;
   }
 
+  /**
+   * Any confirmed barge is a stop request, even when ASR returns empty or
+   * mishears "停". Cancel the current response and keep the model silent for
+   * a short window so it cannot answer with "好的，已暂停…".
+   */
+  markUserStop(): void {
+    this.suppressReplyUntil = Date.now() + 2000;
+  }
+
   sleep(): void {
     if (!this.awake) {
       return;
@@ -353,12 +362,12 @@ export class VoiceBrain {
     // agent kept running).
     const deterministicControl = this.handleDeterministicControl(text);
     const bareStop =
-      /^(停|停止|停下|暂停|别说了|不要说了|stop|cancel)[。！!，,\s]*$/i.test(
+      /^(停|停下|停止|暂停|停一下|停一停|先停|先停一下|别说了|不要说了|stop|cancel)[。！!，,\s]*$/i.test(
         text.trim(),
       );
     if (bareStop) {
       // A bare stop should end playback, not trigger "好的，已暂停…" audio.
-      this.suppressReplyUntil = Date.now() + 2000;
+      this.markUserStop();
       this.provider.cancelResponse();
     }
     if (deterministicControl) {

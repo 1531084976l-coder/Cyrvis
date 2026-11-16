@@ -64,8 +64,10 @@ const CAPTURE_BARGE_SUSTAIN_MS = 150;
 const SPEAKER_REVERB_GUARD_MS = 1400;
 // A bare "停" is often only 200-300ms. The old 220ms decay + 140ms confirm
 // discarded the whole word, so every short stop failed the probe.
-const SPEAKER_PROBE_DECAY_MS = 80;
-const SPEAKER_PROBE_CONFIRM_MS = 100;
+const SPEAKER_PROBE_DECAY_MS = 220;
+const SPEAKER_PROBE_CONFIRM_MS = 140;
+const HEADSET_PROBE_DECAY_MS = 80;
+const HEADSET_PROBE_CONFIRM_MS = 100;
 const SPEAKER_PROBE_TIMEOUT_MS = 700;
 const SPEAKER_PROBE_THRESHOLD = 1100;
 const SPEAKER_RESUME_SUPPRESS_MS = 550;
@@ -186,6 +188,7 @@ const finishSpeakerBargeIn = (buffered: Int16Array[]): void => {
   capturePreroll = [];
   service.provider.bargeIn();
   service.brain.forceAwake();
+  service.brain.markUserStop();
   broadcast('cyrvis:voice:response-stopped');
   emitActivity('speech', '已通过外放麦克风打断助手');
   for (const chunk of buffered) {
@@ -230,8 +233,17 @@ const handleSpeakerProbePcm = (
   if (probe.chunks.length > 100) {
     probe.chunks.shift();
   }
+  // Speaker mode needs a longer decay: its own reverb tail was being counted
+  // as user speech and confirmed false interruptions. Headset mode has almost
+  // no echo, so it can accept a short 200ms "停".
+  const decayMs = speakerOutputMode
+    ? SPEAKER_PROBE_DECAY_MS
+    : HEADSET_PROBE_DECAY_MS;
+  const confirmMs = speakerOutputMode
+    ? SPEAKER_PROBE_CONFIRM_MS
+    : HEADSET_PROBE_CONFIRM_MS;
   const elapsed = now - probe.startedAt;
-  if (elapsed < SPEAKER_PROBE_DECAY_MS) {
+  if (elapsed < decayMs) {
     return;
   }
 
@@ -242,12 +254,12 @@ const handleSpeakerProbePcm = (
     probe.speechMs = Math.max(0, probe.speechMs - chunkMs);
   }
 
-  if (probe.speechMs >= SPEAKER_PROBE_CONFIRM_MS) {
+  if (probe.speechMs >= confirmMs) {
     logger.info('[cyrvis speaker] interrupt confirmed', {
       avg: Math.round(average),
       elapsed,
     });
-    const dropSamples = Math.floor((SPEAKER_PROBE_DECAY_MS * 16000) / 1000);
+    const dropSamples = Math.floor((decayMs * 16000) / 1000);
     const buffered: Int16Array[] = [];
     let remainingDrop = dropSamples;
     for (const chunk of probe.chunks) {
@@ -524,6 +536,7 @@ const triggerBargeIn = () => {
   resetSpeakerDetection();
   service.provider.bargeIn();
   service.brain.forceAwake();
+  service.brain.markUserStop();
   broadcast('cyrvis:voice:response-stopped');
   emitActivity('speech', '已打断助手回答');
 };
