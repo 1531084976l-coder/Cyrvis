@@ -358,9 +358,18 @@ export class GUIAgent<T extends Operator> extends BaseGUIAgent<
         });
 
         // start execute action
+        const batchAllowed = process.env.CYRVIS_ACTION_BATCHING === '1';
+        const executablePredictions = batchAllowed
+          ? parsedPredictions
+          : parsedPredictions.slice(0, 1);
+        if (parsedPredictions.length > 1 && !batchAllowed) {
+          logger.warn('[GUIAgent] action batching disabled; executing first action only', {
+            parsed: parsedPredictions.length,
+          });
+        }
         let actionIndex = 0;
-        for (const parsedPrediction of parsedPredictions) {
-          if (actionIndex > 0 && parsedPredictions.length > 1) {
+        for (const parsedPrediction of executablePredictions) {
+          if (actionIndex > 0 && executablePredictions.length > 1) {
             await sleep(BATCH_ACTION_DELAY_MS);
           }
           actionIndex += 1;

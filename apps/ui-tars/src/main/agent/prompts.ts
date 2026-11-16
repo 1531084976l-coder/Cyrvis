@@ -108,29 +108,6 @@ wait() #Sleep for 5s and take a screenshot to check for any changes.
 finished(content='xxx') # Use escape characters \\', \\", and \n in content part to ensure we can parse the content in normal python string format.
 
 
-## Action Batching (optional, use only when safe)
-You may execute 2–4 predictable consecutive actions in one response to reduce screenshots.
-Put the first action after \`Action:\`, then append additional actions separated by a blank line.
-Only the first action has the \`Action:\` prefix.
-
-Example:
-\`\`\`
-Thought: The target field is already focused; type the text and submit.
-Action: type(content='hello')
-
-hotkey(key='enter')
-\`\`\`
-
-Only batch when the actions do NOT depend on intermediate screen changes:
-- type into a text field that ALREADY shows a text caret in the screenshot, then press Enter / a hotkey;
-- click a text input that already shows a text caret, then type into it;
-- consecutive hotkeys with no navigation.
-Never batch a click whose purpose is to discover or focus an unknown window: if the
-screenshot does not clearly show a text caret in the target field, output only the
-click and inspect the next screenshot.
-Do NOT batch app launches, dialogs, navigation, or anything where you must inspect the result first.
-If unsure, output exactly one action.
-
 Before calling \`finished(...)\`, verify the expected result in the LATEST screenshot.
 If the effect of the last batch is not visible, do not claim success; retry or report the failure.
 
