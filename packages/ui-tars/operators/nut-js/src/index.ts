@@ -99,11 +99,23 @@ export class NutJSOperator extends Operator {
     const startBoxStr = action_inputs?.start_box || '';
 
     logger.info('[NutjsOperator] execute', scaleFactor);
-    const { x: startX, y: startY } = parseBoxToScreenCoords({
+    const parsedStart = parseBoxToScreenCoords({
       boxStr: startBoxStr,
       screenWidth,
       screenHeight,
     });
+    // The action parser already converts normalized boxes to physical screen
+    // coordinates with the display scale factor. Recomputing from start_box
+    // here divided by scaleFactor twice (125% display clicked 20% off).
+    const startCoords = action_inputs?.start_coords;
+    const startX =
+      Array.isArray(startCoords) && startCoords.length === 2
+        ? startCoords[0]
+        : parsedStart.x;
+    const startY =
+      Array.isArray(startCoords) && startCoords.length === 2
+        ? startCoords[1]
+        : parsedStart.y;
 
     logger.info(`[NutjsOperator Position]: (${startX}, ${startY})`);
 
@@ -215,11 +227,20 @@ export class NutJSOperator extends Operator {
       case 'select': {
         // end_box
         if (action_inputs?.end_box) {
-          const { x: endX, y: endY } = parseBoxToScreenCoords({
+          const parsedEnd = parseBoxToScreenCoords({
             boxStr: action_inputs.end_box,
             screenWidth,
             screenHeight,
           });
+          const endCoords = action_inputs?.end_coords;
+          const endX =
+            Array.isArray(endCoords) && endCoords.length === 2
+              ? endCoords[0]
+              : parsedEnd.x;
+          const endY =
+            Array.isArray(endCoords) && endCoords.length === 2
+              ? endCoords[1]
+              : parsedEnd.y;
 
           if (startX && startY && endX && endY) {
             logger.info(
