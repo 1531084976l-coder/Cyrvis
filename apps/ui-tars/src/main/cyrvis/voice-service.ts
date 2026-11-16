@@ -42,6 +42,13 @@ let pttActive = false;
 // Hands-free by default. PTT remains available as a fallback mode.
 let pttMode = false;
 
+/** Uses the configured realtime voice when available. */
+export const speakProactiveText = (text: string): boolean => {
+  if (!service || !text.trim()) return false;
+  service.provider.speak(text);
+  return true;
+};
+
 const CAPTURE_BARGE_THRESHOLD = 1000;
 const CAPTURE_BARGE_SUSTAIN_MS = 150;
 

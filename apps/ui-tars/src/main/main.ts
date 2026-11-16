@@ -31,6 +31,10 @@ import { sanitizeState } from './utils/sanitizeState';
 import { windowManager } from './services/windowManager';
 import { checkBrowserAvailability } from './services/browserCheck';
 import { startVoiceService } from './cyrvis/voice-service';
+import {
+  registerFollowUpService,
+  requestFollowUp,
+} from './cyrvis/follow-up-service';
 
 const { isProd } = env;
 
@@ -120,6 +124,11 @@ const initializeApp = async () => {
   logger.info('createMainWindow');
   let mainWindow = createMainWindow();
 
+  registerFollowUpService();
+  mainWindow.webContents.once('did-finish-load', () => {
+    requestFollowUp('launch', { force: true });
+  });
+
   session.defaultSession.setDisplayMediaRequestHandler(
     (_request, callback) => {
       desktopCapturer.getSources({ types: ['screen'] }).then((sources) => {
@@ -178,6 +187,8 @@ const initializeApp = async () => {
 
   app.on('activate', () => {
     logger.info('app activate');
+    const wasHidden =
+      !mainWindow || mainWindow.isDestroyed() || !mainWindow.isVisible();
     if (!mainWindow || mainWindow.isDestroyed()) {
       mainWindow = createMainWindow();
     } else {
@@ -186,6 +197,7 @@ const initializeApp = async () => {
       }
       mainWindow.focus();
     }
+    if (wasHidden) requestFollowUp('activate');
   });
 
   logger.info('initializeApp end');
