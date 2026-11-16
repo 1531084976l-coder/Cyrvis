@@ -151,3 +151,5 @@
 - [x] 修正上一版坐标修复方向：parser 的 `start_coords` 已乘过 scaleFactor，NutJS 再优先使用它会把 `y=0.98` 变成 1764（屏幕高 1440），点到屏幕外；因此退回“以归一化 start_box 重新计算物理坐标”，不再使用 start_coords。任务栏 Edge 点击应落在 y≈1411。Action Batching 仍保持默认关闭。
 - [x] 速度调整：删除 prompt 里“finished 前核对截图”两行（软约束、Seed 常忽略、对速度无帮助）；`loopIntervalInMs` 1000→500，减少每步固定等待。GUI 仍为 Seed 2.1 Lite、单动作单截图、归一化 start_box 坐标。
 - [x] 语音延迟优化：本地 VAD 端点静音 800ms→500ms（少等约 0.3s）；耳机模式打断阈值 1000/150ms→1500/180ms，减少呼吸/耳机噪声触发的中途截断。Qwen 模型 TTFB 仍约 0.7–1.3s，Token Plan plus 无 qwen3.8 替代。
+- [x] 播放链路改为 WebAudio 连续调度：不再每 0.75s 新建 `<audio>` WAV 段，改为同一 AudioContext 上按时间无缝排队 AudioBufferSourceNode，消除段间咔哒/间隙；首包缓冲 0.35s。支持 `AudioContext.setSinkId` 保持耳机/外放路由，并向主进程发送带真实播放时间的参考 PCM。
+- [x] VAD 端点 500→400ms；再低会切分正常语句停顿，建议 400 为下限。

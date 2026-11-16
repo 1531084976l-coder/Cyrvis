@@ -157,8 +157,8 @@ const electronHandler = {
       ) as Promise<TaskSnapshot | null>,
     sendAudio: (buffer: ArrayBuffer) =>
       ipcRenderer.send('cyrvis:voice:audio', buffer),
-    sendPlaybackReference: (buffer: ArrayBuffer) =>
-      ipcRenderer.send('cyrvis:voice:playback-reference', buffer),
+    sendPlaybackReference: (buffer: ArrayBuffer, startedAt?: number) =>
+      ipcRenderer.send('cyrvis:voice:playback-reference', buffer, startedAt),
     notifyPlaybackIdle: () => ipcRenderer.send('cyrvis:voice:playback-idle'),
     bargeIn: () => ipcRenderer.send('cyrvis:voice:barge-in'),
     forceAwake: () => ipcRenderer.send('cyrvis:voice:force-awake'),

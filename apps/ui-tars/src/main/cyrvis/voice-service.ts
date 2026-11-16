@@ -669,11 +669,14 @@ const registerVoiceIpc = () => {
 
   ipcMain.on(
     'cyrvis:voice:playback-reference',
-    (_event, buffer: ArrayBuffer) => {
+    (_event, buffer: ArrayBuffer, startedAt?: number) => {
       if (speakerProbe || !(buffer instanceof ArrayBuffer)) {
         return;
       }
-      speakerEchoDetector.addReference(new Int16Array(buffer), Date.now());
+      speakerEchoDetector.addReference(
+        new Int16Array(buffer),
+        typeof startedAt === 'number' ? startedAt : Date.now(),
+      );
     },
   );
 
@@ -1025,10 +1028,9 @@ export const startVoiceService = (): VoiceService | null => {
         // 1.2s felt like the assistant was deaf: users repeat "Hello" before
         // the endpoint fires, which extends the utterance and delays it more.
         // 800ms keeps natural pauses while making the first reply snappier.
-        // 800ms felt sluggish: the user stops talking, then waits almost a
-        // second before the request is committed. 500ms keeps a natural pause
-        // while starting the reply noticeably sooner.
-        silenceDurationMs: 500,
+        // 800ms felt sluggish. 400ms is near the practical floor for Chinese
+        // speech: shorter values start splitting normal sentence pauses.
+        silenceDurationMs: 400,
       });
       return provider;
     },

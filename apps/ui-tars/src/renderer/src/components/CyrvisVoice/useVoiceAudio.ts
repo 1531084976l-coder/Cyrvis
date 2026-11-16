@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 
-import { WavStreamPlayer } from './wav-player';
+import { WebAudioStreamPlayer } from './webaudio-player';
 
 // Only one voice pipeline may own mic capture and playback. A stale HMR or
 // duplicate mount must not create a second audio path.
@@ -106,7 +106,7 @@ export function useVoiceAudio() {
   const workletNodeRef = useRef<AudioWorkletNode | null>(null);
   const scriptProcessorRef = useRef<ScriptProcessorNode | null>(null);
   const pendingSamplesRef = useRef<number[]>([]);
-  const playerRef = useRef<WavStreamPlayer | null>(null);
+  const playerRef = useRef<WebAudioStreamPlayer | null>(null);
   const outputDeviceIdRef = useRef<string | null>(null);
   const audioModeRef = useRef<'headset' | 'speaker'>('headset');
   const playbackChunksRef = useRef(0);
@@ -149,18 +149,19 @@ export function useVoiceAudio() {
       }
 
       if (!playerRef.current) {
-        const player = new WavStreamPlayer(
+        const player = new WebAudioStreamPlayer(
           finishPlayback,
           (error) => {
             const detail =
               error instanceof Error
                 ? `${error.name}: ${error.message}`
                 : String(error);
-            console.warn('[cyrvis] wav player error', detail);
+            console.warn('[cyrvis] audio player error', detail);
           },
-          (segmentPcm16) => {
+          (segmentPcm16, startedAt) => {
             window.electron.voice.sendPlaybackReference(
               segmentPcm16.slice().buffer as ArrayBuffer,
+              startedAt,
             );
           },
         );
@@ -170,7 +171,7 @@ export function useVoiceAudio() {
             console.warn('[cyrvis] set playback output failed', error);
           });
         }
-        console.log('[cyrvis] wav stream player created');
+        console.log('[cyrvis] webaudio stream player created');
       }
 
       assistantSpeakingRef.current = true;
