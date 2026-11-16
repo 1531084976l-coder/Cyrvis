@@ -9,11 +9,10 @@ import { GUIAgentManager } from '@main/ipcRoutes/agent';
 import { runAgent } from '@main/services/runAgent';
 import { store } from '@main/store/create';
 import type { AppState } from '@main/store/types';
-import { showMainWindow } from '@main/window';
 import {
   closeScreenMarker,
   hideScreenWaterFlow,
-  hideWidgetWindow,
+  showWidgetWindow,
 } from '@main/window/ScreenMarker';
 
 import type { GUIAdapter, GUIAdapterCallbacks } from './types';
@@ -324,9 +323,8 @@ export class ElectronGUIAdapter implements GUIAdapter {
   }
 
   private restoreUI(): void {
-    hideWidgetWindow();
     closeScreenMarker();
     hideScreenWaterFlow();
-    void showMainWindow();
+    showWidgetWindow();
   }
 }

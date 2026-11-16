@@ -6,20 +6,15 @@ import type { CyrvisController } from './controller';
 import { TaskBusyError } from './controller';
 import { classifyIntent, isExplicitChat } from './intent-gate';
 import { ProactivityPolicy, type ProactivityOptions } from './proactivity';
-import type { ControllerEvent, TaskSnapshot } from './types';
+import type { ControllerEvent } from './types';
+import type { CyrvisVoiceState } from '@shared/cyrvis';
 import type {
   VoiceProvider,
   VoiceProviderCallbacks,
   VoiceToolCallWithId,
 } from './voice/provider';
 
-export interface VoiceBrainState {
-  awake: boolean;
-  userSpeaking: boolean;
-  ttsSpeaking: boolean;
-  lastUserText: string;
-  task: TaskSnapshot;
-}
+export type VoiceBrainState = CyrvisVoiceState;
 
 export interface VoiceBrainCallbacks {
   onAudio?: (pcm16: Int16Array) => void;
@@ -44,6 +39,8 @@ export interface VoiceBrainOptions {
   /** A clear task/control command can wake the assistant without the wake word. */
   autoWakeOnTask?: boolean;
   proactivity?: ProactivityOptions;
+  memoryContextProvider?: () => Promise<string>;
+  rememberFact?: (text: string) => Promise<string | null>;
 }
 
 const DEFAULT_WAKE_PATTERNS: RegExp[] = [
@@ -151,6 +148,16 @@ export class VoiceBrain {
   }
 
   async start(): Promise<void> {
+    if (this.provider.setContext) {
+      const memoryContext =
+        (await this.options
+          .memoryContextProvider?.()
+          .catch((error: unknown) => {
+            console.warn('[cyrvis memory] context load failed', error);
+            return '';
+          })) || '';
+      this.provider.setContext(memoryContext);
+    }
     await this.provider.connect();
     if (!this.requireWakeWord) {
       this.wake();
@@ -481,6 +488,29 @@ export class VoiceBrain {
           call.callId,
           JSON.stringify(this.controller.getStatus()),
         );
+        break;
+      }
+      case 'remember_fact': {
+        const text = call.args.text?.trim();
+        if (!text || !this.options.rememberFact) {
+          this.provider.sendToolResult(
+            call.callId,
+            'ERROR: long-term memory is unavailable or the fact is empty.',
+          );
+          break;
+        }
+        try {
+          await this.options.rememberFact(text);
+          this.provider.sendToolResult(
+            call.callId,
+            JSON.stringify({ ok: true, remembered: text }),
+          );
+        } catch (error) {
+          this.provider.sendToolResult(
+            call.callId,
+            `ERROR: ${error instanceof Error ? error.message : String(error)}`,
+          );
+        }
         break;
       }
       case 'confirm_action': {

@@ -18,7 +18,15 @@ import ElectronStore from 'electron-store';
 
 import * as env from '@main/env';
 import { logger } from '@main/logger';
-import { createMainWindow } from '@main/window/index';
+import {
+  createMainWindow,
+  hideMainWindow,
+  showMainWindow,
+} from '@main/window/index';
+import {
+  showWidgetWindow,
+  syncWidgetOverlayMode,
+} from '@main/window/ScreenMarker';
 import { registerIpcMain } from '@ui-tars/electron-ipc/main';
 import { ipcRoutes } from './ipcRoutes';
 
@@ -40,11 +48,7 @@ if (!app.requestSingleInstanceLock()) {
   app.quit();
 } else {
   app.on('second-instance', () => {
-    const win = BrowserWindow.getAllWindows().find(
-      (item) => item.getTitle() === 'UI-TARS Desktop',
-    );
-    win?.show();
-    win?.focus();
+    void showMainWindow();
   });
 }
 
@@ -154,9 +158,16 @@ const initializeApp = async () => {
   );
 
   const { unsubscribe } = registerIPCHandlers([mainWindow]);
+  const unsubscribeWidgetOverlay = SettingStore.getInstance().onDidAnyChange(
+    () => {
+      syncWidgetOverlayMode();
+    },
+  );
 
   // Voice layer is optional; it no-ops when QWEN_API_KEY is absent.
   startVoiceService();
+  await hideMainWindow();
+  showWidgetWindow();
 
   app.on('window-all-closed', () => {
     logger.info('window-all-closed');
@@ -173,6 +184,7 @@ const initializeApp = async () => {
 
   app.on('quit', () => {
     logger.info('app quit');
+    unsubscribeWidgetOverlay();
     unsubscribe();
   });
 

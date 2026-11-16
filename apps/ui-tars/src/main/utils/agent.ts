@@ -13,11 +13,10 @@ import {
 import {
   closeScreenMarker,
   hideScreenWaterFlow,
-  hideWidgetWindow,
   showScreenWaterFlow,
   showWidgetWindow,
 } from '../window/ScreenMarker';
-import { hideMainWindow, showMainWindow } from '../window';
+import { hideMainWindow } from '../window';
 import { SearchEngine } from '@ui-tars/operator-browser';
 
 export const getModelVersion = (
@@ -31,6 +30,7 @@ export const getModelVersion = (
     case VLMProviderV2.doubao_1_5:
       return UITarsModelVersion.DOUBAO_1_5_15B;
     case VLMProviderV2.doubao_1_5_vl:
+    case VLMProviderV2.doubao_seed_2_1_turbo:
       return UITarsModelVersion.DOUBAO_1_5_20B;
     default:
       return UITarsModelVersion.V1_0;
@@ -87,14 +87,12 @@ export const afterAgentRun = (operator: Operator) => {
     case Operator.RemoteBrowser:
       break;
     case Operator.LocalComputer:
-      hideWidgetWindow();
       closeScreenMarker();
       hideScreenWaterFlow();
-      showMainWindow();
+      showWidgetWindow();
       break;
     case Operator.LocalBrowser:
-      hideWidgetWindow();
-      showMainWindow();
+      showWidgetWindow();
       break;
     default:
       break;

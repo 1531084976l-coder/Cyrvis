@@ -52,15 +52,15 @@ VLM 接口类型容易混淆：
 
 ## 文档
 
-| 文档 | 内容 |
-|---|---|
-| [doc/README.md](./doc/README.md) | 文档索引与代码地图 |
-| [doc/architecture.md](./doc/architecture.md) | 整体分层、状态机、接口 |
-| [doc/voice-architecture.md](./doc/voice-architecture.md) | 语音实现权威说明 |
-| [doc/roadmap.md](./doc/roadmap.md) | GUI 加速/MCP、UI、眼动、主动性/记忆 |
-| [doc/development.md](./doc/development.md) | 环境、启动、测试、日志、故障 |
-| [doc/progress.md](./doc/progress.md) | 实时进度 |
-| [doc/findings.md](./doc/findings.md) | 排障结论 |
+| 文档                                                     | 内容                                |
+| -------------------------------------------------------- | ----------------------------------- |
+| [doc/README.md](./doc/README.md)                         | 文档索引与代码地图                  |
+| [doc/architecture.md](./doc/architecture.md)             | 整体分层、状态机、接口              |
+| [doc/voice-architecture.md](./doc/voice-architecture.md) | 语音实现权威说明                    |
+| [doc/roadmap.md](./doc/roadmap.md)                       | GUI 加速/MCP、UI、眼动、主动性/记忆 |
+| [doc/development.md](./doc/development.md)               | 环境、启动、测试、日志、故障        |
+| [doc/progress.md](./doc/progress.md)                     | 实时进度                            |
+| [doc/findings.md](./doc/findings.md)                     | 排障结论                            |
 
 ## 目录
 

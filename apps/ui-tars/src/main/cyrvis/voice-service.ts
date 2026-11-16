@@ -3,6 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 import { execFile } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 
@@ -10,10 +11,20 @@ import { app, BrowserWindow, globalShortcut, ipcMain } from 'electron';
 
 import * as env from '@main/env';
 import { logger } from '@main/logger';
+import {
+  describeControllerEvent,
+  describeVoiceToolCall,
+  type CyrvisActivityEvent,
+  type CyrvisMemoryTurnRole,
+  type VoiceToolName,
+} from '@shared/cyrvis';
 
 import { startCaptureService, type CaptureService } from './capture-service';
 import { CyrvisController } from './controller';
 import { ElectronGUIAdapter } from './gui-adapter';
+import { voiceMemoryService } from './memory';
+import { SpeakerEchoDetector } from './speaker-barge';
+import { isLikelySpeakerEcho } from './speaker-echo';
 import { QwenOmniProvider } from './voice/qwen-omni';
 import { VoiceBrain, type VoiceBrainState } from './voice-brain';
 import type { ControllerEvent } from './types';
@@ -31,56 +42,33 @@ let captureGeneration = 0;
 let captureRetryTimer: ReturnType<typeof setTimeout> | null = null;
 let captureRetryAttempts = 0;
 let assistantPlaybackActive = false;
-let captureBargeMs = 0;
 let capturePreroll: Int16Array[] = [];
 let lastCaptureLogAt = 0;
 // Two selectable audio modes:
-// - headset: capture without AEC + voice barge-in (verified)
-// - speaker: external output + voice barge-in with a higher energy threshold.
-//   The capture renderer has no AEC reference, so raw mic + threshold is used;
-//   a short post-playback guard only absorbs reverb.
+// - headset: capture without AEC + full voice barge-in (verified)
+// - speaker: reference-aware echo gating plus an interrupt probe, so the
+//   assistant can still be interrupted while its own audio is playing.
 let audioMode: 'headset' | 'speaker' = 'headset';
 let speakerOutputMode = false;
 let speakerGuardUntil = 0;
-let speakerBargeSuppressed = false;
-let speakerProbePending = false;
-let speakerProbeUntil = 0;
-let speakerProbeSum = 0;
-let speakerProbeCount = 0;
-let speakerProbeMax = 0;
-// Rolling mic energy during speaker playback. The median approximates the
-// current speaker leakage floor: high while TTS is loud, low in pauses. Barge
-// is allowed when the user is clearly louder than that floor.
-let speakerLeakWindow: number[] = [];
-// Once leakage/self-echo is observed, raise the barge threshold for a cooldown
-// instead of disabling voice interruption entirely.
-let speakerEchoUntil = 0;
+let lastAssistantText = '';
+let lastAssistantAt = 0;
 let ipcRegistered = false;
 let testAudioActive = false;
 let pttActive = false;
 // Hands-free by default. PTT remains available as a fallback mode.
-let pttMode = false;
+const pttMode = false;
 
 const CAPTURE_BARGE_THRESHOLD = 1000;
 const CAPTURE_BARGE_SUSTAIN_MS = 150;
-// External speakers + an in-ear mic: keep listening during playback so voice
-// barge-in works. The threshold is higher because speaker leakage is possible.
-const SPEAKER_BARGE_THRESHOLD = Number(
-  process.env.CYRVIS_SPEAKER_BARGE_THRESHOLD || 2000,
-);
-const SPEAKER_BARGE_SUSTAIN_MS = 180;
-// Measure the mic during the first 1200ms of *actual playback* (not from
-// response.created, which can arrive before any audio). If the speaker leaks
-// into the mic, voice barge is unreliable and would make the model answer its
-// own audio; suppress barge and let the reply finish.
-const SPEAKER_ECHO_GUARD = Number(
-  process.env.CYRVIS_SPEAKER_ECHO_GUARD || 1500,
-);
-const SPEAKER_ECHO_PROBE_MS = 1200;
-const SPEAKER_ECHO_COOLDOWN_MS = 60_000;
-const SPEAKER_LEAK_WINDOW_CHUNKS = 25; // ~500ms of 20ms chunks
-const SPEAKER_LEAK_FACTOR = 4;
-const SPEAKER_GATED_BARGE_THRESHOLD = 2500;
+const SPEAKER_REVERB_GUARD_MS = 1400;
+const SPEAKER_PROBE_DECAY_MS = 220;
+const SPEAKER_PROBE_CONFIRM_MS = 140;
+const SPEAKER_PROBE_TIMEOUT_MS = 700;
+const SPEAKER_PROBE_THRESHOLD = 1100;
+const SPEAKER_RESUME_SUPPRESS_MS = 550;
+const SPEAKER_DIRECT_PREROLL_CHUNKS = 24;
+const HEADSET_REVERB_GUARD_MS = 900;
 
 const AUDIO_SCRIPT_CANDIDATES = () => [
   path.resolve(
@@ -143,6 +131,204 @@ const switchWindowsDefaultOutput = async (
   });
 };
 
+interface SpeakerProbeState {
+  startedAt: number;
+  speechMs: number;
+  chunks: Int16Array[];
+}
+
+const speakerEchoDetector = new SpeakerEchoDetector();
+let speakerProbe: SpeakerProbeState | null = null;
+let speakerCandidateMs = 0;
+let speakerResumeSuppressUntil = 0;
+let lastSpeakerDiagnosticAt = 0;
+let speakerBargeStopPending = false;
+let speakerBargeStopTimer: ReturnType<typeof setTimeout> | null = null;
+
+const pushCapturePreroll = (pcm16: Int16Array): void => {
+  capturePreroll.push(pcm16.slice());
+  if (capturePreroll.length > 30) {
+    capturePreroll.shift();
+  }
+};
+
+const resetSpeakerDetection = (): void => {
+  speakerEchoDetector.reset();
+  speakerProbe = null;
+  speakerCandidateMs = 0;
+  speakerResumeSuppressUntil = 0;
+};
+
+const expectSpeakerBargeStop = (): void => {
+  speakerBargeStopPending = true;
+  if (speakerBargeStopTimer) {
+    clearTimeout(speakerBargeStopTimer);
+  }
+  speakerBargeStopTimer = setTimeout(() => {
+    speakerBargeStopTimer = null;
+    speakerBargeStopPending = false;
+  }, 1500);
+};
+
+const finishSpeakerBargeIn = (buffered: Int16Array[]): void => {
+  if (!service) {
+    return;
+  }
+
+  speakerProbe = null;
+  speakerCandidateMs = 0;
+  expectSpeakerBargeStop();
+  assistantPlaybackActive = false;
+  speakerGuardUntil = 0;
+  speakerEchoDetector.reset();
+  capturePreroll = [];
+  service.provider.bargeIn();
+  service.brain.forceAwake();
+  broadcast('cyrvis:voice:response-stopped');
+  emitActivity('speech', '已通过外放麦克风打断助手');
+  for (const chunk of buffered) {
+    service.provider.sendAudio(chunk);
+  }
+};
+
+const resumeSpeakerPlayback = (): void => {
+  speakerProbe = null;
+  speakerCandidateMs = 0;
+  speakerResumeSuppressUntil = Date.now() + SPEAKER_RESUME_SUPPRESS_MS;
+  // Keep the playback references collected before the probe. Resetting them
+  // here made the next analysis run with corr=0 and triggered a second probe
+  // for the same sentence.
+  speakerEchoDetector.setReferenceEnabled(true);
+  broadcast('cyrvis:voice:playback-resume');
+};
+
+const startSpeakerProbe = (now: number): void => {
+  speakerProbe = {
+    startedAt: now,
+    speechMs: 0,
+    chunks: [],
+  };
+  speakerCandidateMs = 0;
+  speakerEchoDetector.setReferenceEnabled(false);
+  broadcast('cyrvis:voice:playback-pause');
+  logger.info('[cyrvis speaker] playback paused for interrupt probe');
+};
+
+const handleSpeakerProbePcm = (
+  pcm16: Int16Array,
+  average: number,
+  now: number,
+): void => {
+  const probe = speakerProbe;
+  if (!probe) {
+    return;
+  }
+
+  probe.chunks.push(pcm16.slice());
+  if (probe.chunks.length > 100) {
+    probe.chunks.shift();
+  }
+  const elapsed = now - probe.startedAt;
+  if (elapsed < SPEAKER_PROBE_DECAY_MS) {
+    return;
+  }
+
+  const chunkMs = (pcm16.length / 16000) * 1000;
+  if (average > SPEAKER_PROBE_THRESHOLD) {
+    probe.speechMs += chunkMs;
+  } else {
+    probe.speechMs = Math.max(0, probe.speechMs - chunkMs);
+  }
+
+  if (probe.speechMs >= SPEAKER_PROBE_CONFIRM_MS) {
+    logger.info('[cyrvis speaker] interrupt confirmed', {
+      avg: Math.round(average),
+      elapsed,
+    });
+    const dropSamples = Math.floor((SPEAKER_PROBE_DECAY_MS * 16000) / 1000);
+    const buffered: Int16Array[] = [];
+    let remainingDrop = dropSamples;
+    for (const chunk of probe.chunks) {
+      if (remainingDrop >= chunk.length) {
+        remainingDrop -= chunk.length;
+        continue;
+      }
+      buffered.push(
+        remainingDrop > 0 ? chunk.slice(remainingDrop) : chunk.slice(),
+      );
+      remainingDrop = 0;
+    }
+    finishSpeakerBargeIn(buffered);
+    return;
+  }
+
+  if (elapsed >= SPEAKER_PROBE_TIMEOUT_MS) {
+    logger.info('[cyrvis speaker] interrupt probe rejected', {
+      elapsed,
+      speechMs: Math.round(probe.speechMs),
+    });
+    resumeSpeakerPlayback();
+  }
+};
+
+const handleSpeakerPlaybackPcm = (
+  pcm16: Int16Array,
+  average: number,
+  now: number,
+): void => {
+  if (speakerProbe) {
+    handleSpeakerProbePcm(pcm16, average, now);
+    return;
+  }
+
+  const analysis = speakerEchoDetector.analyze(pcm16, now);
+  if (now - lastSpeakerDiagnosticAt >= 1000) {
+    lastSpeakerDiagnosticAt = now;
+    logger.info('[cyrvis speaker] echo analysis', {
+      avg: Math.round(average),
+      ref: Math.round(analysis.referenceAverage * 0x8000),
+      corr: Number(analysis.correlation.toFixed(3)),
+      echo: analysis.likelyEcho,
+      ambiguous: analysis.ambiguous,
+    });
+  }
+
+  if (now < speakerResumeSuppressUntil) {
+    speakerCandidateMs = 0;
+    return;
+  }
+
+  const chunkMs = (pcm16.length / 16000) * 1000;
+  if (average <= CAPTURE_BARGE_THRESHOLD || analysis.likelyEcho) {
+    speakerCandidateMs = Math.max(0, speakerCandidateMs - chunkMs);
+    return;
+  }
+
+  speakerCandidateMs += chunkMs;
+  if (speakerCandidateMs < CAPTURE_BARGE_SUSTAIN_MS) {
+    return;
+  }
+
+  // Missing references happen between WAV segments and during device
+  // latency. In that window a loud speaker tail is indistinguishable from a
+  // user, so fail closed and wait for the next valid playback reference.
+  if (!analysis.referenceActive) {
+    speakerCandidateMs = 0;
+    return;
+  }
+
+  if (analysis.ambiguous) {
+    startSpeakerProbe(now);
+    return;
+  }
+
+  logger.info('[cyrvis speaker] direct interrupt detected', {
+    avg: Math.round(average),
+    corr: Number(analysis.correlation.toFixed(3)),
+  });
+  finishSpeakerBargeIn(capturePreroll.slice(-SPEAKER_DIRECT_PREROLL_CHUNKS));
+};
+
 /**
  * Microphone audio comes from a hidden renderer that never plays audio.
  * Playback lives in the main window; separating the two audio sessions is
@@ -154,13 +340,8 @@ const handleCapturePcm = (pcm16: Int16Array): void => {
   }
 
   let sum = 0;
-  let peak = 0;
   for (let i = 0; i < pcm16.length; i += 1) {
-    const value = Math.abs(pcm16[i]);
-    sum += value;
-    if (value > peak) {
-      peak = value;
-    }
+    sum += Math.abs(pcm16[i]);
   }
   const average = sum / pcm16.length;
 
@@ -169,107 +350,31 @@ const handleCapturePcm = (pcm16: Int16Array): void => {
     lastCaptureLogAt = now;
     logger.info('[cyrvis capture] level', {
       avg: Math.round(average),
-      peak,
       playing: assistantPlaybackActive,
       mode: audioMode,
     });
   }
 
-  // Keep a 600ms pre-roll in both modes so the beginning of "停" is not lost.
-  capturePreroll.push(pcm16.slice());
-  if (capturePreroll.length > 30) {
-    capturePreroll.shift();
-  }
+  pushCapturePreroll(pcm16);
 
   if (assistantPlaybackActive) {
-    if (speakerOutputMode) {
-      speakerLeakWindow.push(average);
-      if (speakerLeakWindow.length > SPEAKER_LEAK_WINDOW_CHUNKS) {
-        speakerLeakWindow.shift();
-      }
-    }
-    if (speakerOutputMode && speakerProbeUntil > 0) {
-      if (now < speakerProbeUntil) {
-        speakerProbeSum += average;
-        speakerProbeCount += 1;
-        if (average > speakerProbeMax) {
-          speakerProbeMax = average;
-        }
-        captureBargeMs = 0;
-        return;
-      }
-      const probeAvg = speakerProbeSum / Math.max(1, speakerProbeCount);
-      speakerProbeUntil = 0;
-      if (
-        probeAvg > SPEAKER_ECHO_GUARD ||
-        speakerProbeMax > SPEAKER_ECHO_GUARD * 2
-      ) {
-        speakerBargeSuppressed = true;
-        speakerEchoUntil = now + SPEAKER_ECHO_COOLDOWN_MS;
-        logger.warn('[cyrvis voice] high speaker leakage; barge gated', {
-          avg: Math.round(probeAvg),
-          max: Math.round(speakerProbeMax),
-          guard: SPEAKER_ECHO_GUARD,
-          cooldownMs: SPEAKER_ECHO_COOLDOWN_MS,
-        });
-      } else {
-        logger.info('[cyrvis voice] speaker leakage acceptable', {
-          avg: Math.round(probeAvg),
-          max: Math.round(speakerProbeMax),
-        });
-      }
-    }
-    const chunkMs = (pcm16.length / 16000) * 1000;
-    let threshold = speakerOutputMode
-      ? SPEAKER_BARGE_THRESHOLD
-      : CAPTURE_BARGE_THRESHOLD;
-    let leakFloor = 0;
-    if (speakerOutputMode) {
-      // While TTS is loud the mic is dominated by speaker leakage; while it is
-      // between words the floor drops. Requiring the user to be clearly above
-      // the local floor lets "停" work in pauses without false triggers.
-      const sorted = [...speakerLeakWindow].sort((a, b) => a - b);
-      leakFloor = sorted[Math.floor(sorted.length / 2)] ?? 0;
-      threshold = Math.max(
-        threshold,
-        leakFloor * SPEAKER_LEAK_FACTOR,
-        speakerBargeSuppressed ? SPEAKER_GATED_BARGE_THRESHOLD : 0,
-      );
-    }
-    const sustainMs = speakerOutputMode
-      ? SPEAKER_BARGE_SUSTAIN_MS
-      : CAPTURE_BARGE_SUSTAIN_MS;
-    if (average > threshold) {
-      captureBargeMs += chunkMs;
-    } else {
-      captureBargeMs = Math.max(0, captureBargeMs - chunkMs);
-    }
-    if (captureBargeMs >= sustainMs) {
-      logger.info('[cyrvis capture] barge-in', {
-        avg: Math.round(average),
-        mode: audioMode,
-        threshold: Math.round(threshold),
-        leakFloor: Math.round(leakFloor),
-      });
-      assistantPlaybackActive = false;
-      speakerGuardUntil = 0;
-      captureBargeMs = 0;
-      const buffered = capturePreroll.splice(0);
-      service.provider.bargeIn();
-      service.brain.forceAwake();
-      broadcast('cyrvis:voice:response-stopped');
-      for (const chunk of buffered) {
-        service.provider.sendAudio(chunk);
-      }
-    }
+    // Reference-aware gating is always active, not only when the user has
+    // explicitly selected speaker output. The physical output device can be
+    // a laptop speaker even while the UI is still in headset mode.
+    handleSpeakerPlaybackPcm(pcm16, average, now);
     return;
   }
 
-  // A very short reverb guard only; do not drop the mic for 800ms after TTS.
-  if (speakerOutputMode && now < speakerGuardUntil) {
+  const analysis = speakerEchoDetector.analyze(pcm16, now);
+  if (analysis.likelyEcho) {
     return;
   }
-  captureBargeMs = 0;
+  const clearUserSpeech =
+    average > CAPTURE_BARGE_THRESHOLD && !analysis.ambiguous;
+  if (now < speakerGuardUntil && !clearUserSpeech) {
+    return;
+  }
+
   service.provider.sendAudio(pcm16);
 };
 
@@ -331,6 +436,7 @@ const startCapture = async (resetRetries = false): Promise<void> => {
             mode: audioMode,
           });
           broadcast('cyrvis:voice:capture-ready', { label });
+          emitActivity('session', `麦克风已连接：${label}`);
         },
         onError: (message) => {
           if (generation !== captureGeneration) {
@@ -339,12 +445,13 @@ const startCapture = async (resetRetries = false): Promise<void> => {
           captureReady = false;
           logger.error('[cyrvis capture] error', { message });
           broadcast('cyrvis:voice:capture-error', { message });
+          emitActivity('error', `麦克风连接失败：${message}`);
           scheduleCaptureRetry(message);
         },
       },
-      // The hidden capture renderer has no reference to the main window's
-      // playback, so AEC cannot cancel external speakers. Keep the mic raw and
-      // use the energy threshold above for barge-in instead.
+      // The capture renderer has no reference signal from the playback
+      // renderer. Keep browser AEC off and perform reference-aware gating in
+      // the main process instead.
       { echoCancellation: false },
     );
   } catch (error) {
@@ -353,6 +460,7 @@ const startCapture = async (resetRetries = false): Promise<void> => {
       const message = error instanceof Error ? error.message : String(error);
       logger.error('[cyrvis capture] start failed', { message });
       broadcast('cyrvis:voice:capture-error', { message });
+      emitActivity('error', `麦克风连接失败：${message}`);
       scheduleCaptureRetry(message);
     }
     throw error;
@@ -367,6 +475,38 @@ const broadcast = (channel: string, payload?: unknown) => {
   }
 };
 
+const emitActivity = (
+  kind: CyrvisActivityEvent['kind'],
+  text: string,
+): void => {
+  const event: CyrvisActivityEvent = {
+    id: randomUUID(),
+    kind,
+    text,
+    createdAt: Date.now(),
+  };
+  broadcast('cyrvis:voice:activity', event);
+  void voiceMemoryService.appendActivity(event).catch((error) => {
+    logger.warn('[cyrvis memory] activity persist failed', error);
+  });
+};
+
+const syncProviderMemoryContext = async (): Promise<void> => {
+  if (!service) {
+    return;
+  }
+  service.provider.setContext(await voiceMemoryService.getContext());
+};
+
+const recordTurn = (role: CyrvisMemoryTurnRole, text: string): void => {
+  void voiceMemoryService
+    .appendTurn(role, text)
+    .then(() => syncProviderMemoryContext())
+    .catch((error) => {
+      logger.warn('[cyrvis memory] turn persist failed', error);
+    });
+};
+
 const broadcastPtt = () => {
   broadcast('cyrvis:voice:ptt', { active: pttActive, mode: pttMode });
 };
@@ -376,14 +516,14 @@ const triggerBargeIn = () => {
     return;
   }
   logger.info('[cyrvis voice] barge-in');
+  expectSpeakerBargeStop();
   assistantPlaybackActive = false;
-  captureBargeMs = 0;
-  speakerBargeSuppressed = false;
-  speakerProbeUntil = 0;
-  speakerLeakWindow = [];
+  capturePreroll = [];
+  resetSpeakerDetection();
   service.provider.bargeIn();
   service.brain.forceAwake();
   broadcast('cyrvis:voice:response-stopped');
+  emitActivity('speech', '已打断助手回答');
 };
 
 const setPttActive = (active: boolean) => {
@@ -437,11 +577,33 @@ const registerVoiceIpc = () => {
     return service?.brain.getState() ?? null;
   });
 
+  ipcMain.handle('cyrvis:voice:get-memory', () => {
+    return voiceMemoryService.getSnapshot();
+  });
+
+  ipcMain.handle('cyrvis:voice:get-capture-ready', () => ({
+    ready: captureReady,
+  }));
+
   ipcMain.handle('cyrvis:voice:cancel-task', async () => {
     if (!service) {
       return null;
     }
     return service.controller.cancelTask();
+  });
+
+  ipcMain.handle('cyrvis:voice:pause-task', async () => {
+    if (!service) {
+      return null;
+    }
+    return service.controller.pauseTask();
+  });
+
+  ipcMain.handle('cyrvis:voice:resume-task', async () => {
+    if (!service) {
+      return null;
+    }
+    return service.controller.resumeTask();
   });
 
   ipcMain.on('cyrvis:voice:audio', (_event, buffer: ArrayBuffer) => {
@@ -453,6 +615,16 @@ const registerVoiceIpc = () => {
     }
     service.provider.sendAudio(new Int16Array(buffer));
   });
+
+  ipcMain.on(
+    'cyrvis:voice:playback-reference',
+    (_event, buffer: ArrayBuffer) => {
+      if (speakerProbe || !(buffer instanceof ArrayBuffer)) {
+        return;
+      }
+      speakerEchoDetector.addReference(new Int16Array(buffer), Date.now());
+    },
+  );
 
   ipcMain.handle('cyrvis:voice:test-audio', async () => {
     if (!env.isDev || !service) {
@@ -532,24 +704,18 @@ const registerVoiceIpc = () => {
     audioMode = nextMode;
     speakerOutputMode = nextMode === 'speaker';
     speakerGuardUntil = 0;
-    speakerBargeSuppressed = false;
-    speakerProbePending = false;
-    speakerProbeUntil = 0;
-    speakerEchoUntil = 0;
-    speakerLeakWindow = [];
-    captureBargeMs = 0;
     capturePreroll = [];
+    if (speakerProbe) {
+      broadcast('cyrvis:voice:playback-resume');
+    }
+    resetSpeakerDetection();
     logger.info('[cyrvis voice] audio mode', {
       mode: audioMode,
       echoCancellation: false,
-      bargeThreshold: speakerOutputMode
-        ? SPEAKER_BARGE_THRESHOLD
-        : CAPTURE_BARGE_THRESHOLD,
     });
     broadcast('cyrvis:voice:audio-mode', { mode: audioMode });
     if (changed) {
       // Bluetooth profile/A2DP switches briefly drop the HFP microphone.
-      // Give Windows time to settle before opening the hidden capture window.
       await new Promise((resolve) => setTimeout(resolve, 500));
       try {
         await startCapture(true);
@@ -567,8 +733,11 @@ const registerVoiceIpc = () => {
       return { ok: false, error: 'output label is required' };
     }
     // Output device and voice mode are independent on purpose: the user can
-    // route audio to external speakers while keeping headset/full-duplex mode
-    // and voice barge-in (e.g. an in-ear mic + external speakers).
+    // route audio to external speakers while keeping headset/full-duplex mode.
+    if (speakerProbe) {
+      broadcast('cyrvis:voice:playback-resume');
+    }
+    resetSpeakerDetection();
     logger.info('[cyrvis voice] output label', { label, mode: audioMode });
     broadcast('cyrvis:voice:set-output', label);
     return { ok: true, mode: audioMode, speaker: speakerOutputMode };
@@ -588,14 +757,21 @@ const registerVoiceIpc = () => {
   });
 
   ipcMain.on('cyrvis:voice:playback-idle', () => {
+    const bargeStopPending = speakerBargeStopPending;
+    speakerBargeStopPending = false;
+    if (speakerBargeStopTimer) {
+      clearTimeout(speakerBargeStopTimer);
+      speakerBargeStopTimer = null;
+    }
     assistantPlaybackActive = false;
-    captureBargeMs = 0;
-    speakerBargeSuppressed = false;
-    speakerProbePending = false;
-    speakerProbeUntil = 0;
-    speakerLeakWindow = [];
-    speakerGuardUntil = speakerOutputMode ? Date.now() + 100 : 0;
-    service?.provider.notifyPlaybackIdle();
+    resetSpeakerDetection();
+    speakerGuardUntil = !bargeStopPending
+      ? Date.now() +
+        (speakerOutputMode ? SPEAKER_REVERB_GUARD_MS : HEADSET_REVERB_GUARD_MS)
+      : 0;
+    service?.provider.notifyPlaybackIdle(
+      speakerOutputMode && !bargeStopPending ? 150 : 0,
+    );
   });
 
   ipcMain.on('cyrvis:voice:barge-in', () => {
@@ -616,6 +792,11 @@ const registerVoiceIpc = () => {
  * No-op when QWEN_API_KEY is absent.
  */
 export const startVoiceService = (): VoiceService | null => {
+  // Keep the renderer control surface available even when the model key is
+  // missing. It reports a clean "not configured" state instead of exposing
+  // Electron's missing IPC handler error in the floating panel.
+  registerVoiceIpc();
+
   if (service) {
     return service;
   }
@@ -646,89 +827,98 @@ export const startVoiceService = (): VoiceService | null => {
         logger.info('[cyrvis voice] speech stopped');
         broadcast('cyrvis:voice:speech-stopped');
       },
-      onTranscript: (text, final) =>
-        broadcast('cyrvis:voice:transcript', { text, final }),
+      onTranscript: (text, final) => {
+        broadcast('cyrvis:voice:transcript', { text, final });
+        if (final) {
+          recordTurn('user', text);
+        }
+      },
       onAssistantText: (text, final) => {
         logger.info('[cyrvis voice] assistant text', { text, final });
         broadcast('cyrvis:voice:assistant', { text, final });
+        lastAssistantAt = Date.now();
+        lastAssistantText = final ? text : `${lastAssistantText}${text}`;
+        if (final) {
+          recordTurn('assistant', text);
+        }
       },
       onState: (state: VoiceBrainState) =>
         broadcast('cyrvis:voice:state', state),
       onWake: () => {
         logger.info('[cyrvis voice] wake');
         broadcast('cyrvis:voice:wake');
+        emitActivity('session', '语音会话已唤醒');
       },
       onSleep: () => {
         logger.info('[cyrvis voice] sleep');
         broadcast('cyrvis:voice:sleep');
+        emitActivity('session', '语音会话已休眠');
       },
-      onTaskEvent: (event: ControllerEvent) =>
-        broadcast('cyrvis:voice:task-event', event),
-      onSelfEcho: () => {
-        if (speakerOutputMode) {
-          speakerBargeSuppressed = true;
-          speakerProbePending = false;
-          speakerProbeUntil = 0;
-          speakerEchoUntil = Date.now() + SPEAKER_ECHO_COOLDOWN_MS;
-          logger.warn(
-            '[cyrvis voice] self-echo; speaker barge gated',
-            { cooldownMs: SPEAKER_ECHO_COOLDOWN_MS },
-          );
+      onTaskEvent: (event: ControllerEvent) => {
+        broadcast('cyrvis:voice:task-event', event);
+        const text = describeControllerEvent(event);
+        if (text) {
+          emitActivity(event.type === 'task_failed' ? 'error' : 'task', text);
         }
       },
-      onError: (error) => logger.error('[cyrvis voice] error', error),
+      onError: (error) => {
+        logger.error('[cyrvis voice] error', error);
+        emitActivity('error', `语音服务错误：${error.message}`);
+      },
     },
     (callbacks) => {
       const wrapped = {
         ...callbacks,
         onReady: () => {
           logger.info('[cyrvis voice] qwen session ready');
+          emitActivity('session', 'Qwen Realtime 已连接');
           callbacks.onReady?.();
         },
         onTranscript: (text: string, final: boolean) => {
           logger.info('[cyrvis voice] transcript', { text, final });
+          if (
+            final &&
+            isLikelySpeakerEcho(
+              text,
+              lastAssistantText,
+              Date.now() - lastAssistantAt,
+            )
+          ) {
+            logger.warn('[cyrvis voice] ignored likely speaker echo', {
+              transcript: text,
+            });
+            provider?.cancelResponse();
+            provider?.clearAudioBuffer();
+            broadcast('cyrvis:voice:transcript', { text: '', final: true });
+            emitActivity('speech', '已忽略外放回声，未触发追问');
+            return;
+          }
           callbacks.onTranscript?.(text, final);
         },
         onResponseStarted: () => {
+          speakerBargeStopPending = false;
+          if (speakerBargeStopTimer) {
+            clearTimeout(speakerBargeStopTimer);
+            speakerBargeStopTimer = null;
+          }
+          resetSpeakerDetection();
           assistantPlaybackActive = true;
-          captureBargeMs = 0;
           capturePreroll = [];
           speakerGuardUntil = 0;
-          speakerBargeSuppressed =
-            speakerOutputMode && Date.now() < speakerEchoUntil;
-          speakerProbePending =
-            speakerOutputMode && !speakerBargeSuppressed;
-          speakerProbeUntil = 0;
-          speakerProbeSum = 0;
-          speakerProbeCount = 0;
-          speakerProbeMax = 0;
-          speakerLeakWindow = [];
-          if (speakerOutputMode) {
-            // Drop any residual speaker/TTS audio still in the ASR buffer.
-            service?.provider.clearAudioBuffer();
-          }
+          lastAssistantText = '';
+          // Never carry playback-tail audio into the next ASR turn, regardless
+          // of which output mode the UI currently reports.
+          service?.provider.clearAudioBuffer();
           broadcast('cyrvis:voice:response-started');
+          emitActivity('speech', '助手开始流式回答');
           callbacks.onResponseStarted?.();
-        },
-        onAudio: (pcm16: Int16Array) => {
-          // Probe starts with the first *audible* chunk, not response.created:
-          // generation can take hundreds of ms, so an earlier probe only sees
-          // silence and misses the speaker leakage entirely.
-          if (speakerOutputMode && speakerProbePending) {
-            speakerProbePending = false;
-            speakerProbeUntil = Date.now() + SPEAKER_ECHO_PROBE_MS;
-            speakerProbeSum = 0;
-            speakerProbeCount = 0;
-            speakerProbeMax = 0;
-            service?.provider.clearAudioBuffer();
-          }
-          callbacks.onAudio?.(pcm16);
         },
         onResponseDone: () => {
           // Tool-call-only responses produce no audio. Tell the renderer so
           // its half-duplex gate does not stay closed for the watchdog period
           // and swallow the user's next words (e.g. "stop").
           broadcast('cyrvis:voice:response-done');
+          emitActivity('speech', '助手回答完成');
           callbacks.onResponseDone?.();
         },
         onUtteranceCommitted: () => {
@@ -739,16 +929,32 @@ export const startVoiceService = (): VoiceService | null => {
           // speech and the first response token, so the user does not repeat
           // themselves thinking they were not heard.
           broadcast('cyrvis:voice:thinking');
+          emitActivity('speech', '正在理解语音指令');
           callbacks.onUtteranceCommitted?.();
         },
         onToolCall: (
           call: Parameters<NonNullable<typeof callbacks.onToolCall>>[0],
         ) => {
           logger.info('[cyrvis voice] tool call', call.name, call.args);
+          const instruction =
+            call.name === 'start_gui_task'
+              ? call.args.instruction
+              : call.name === 'remember_fact'
+                ? call.args.text
+                : undefined;
+          broadcast('cyrvis:voice:tool-call', {
+            name: call.name,
+            instruction,
+          });
+          emitActivity(
+            call.name === 'remember_fact' ? 'memory' : 'tool',
+            describeVoiceToolCall(call.name as VoiceToolName, instruction),
+          );
           callbacks.onToolCall?.(call);
         },
         onError: (error: Error) => {
           logger.error('[cyrvis voice] provider error', error);
+          emitActivity('error', `语音模型错误：${error.message}`);
           callbacks.onError?.(error);
         },
       };
@@ -776,11 +982,18 @@ export const startVoiceService = (): VoiceService | null => {
         minGapMs: 5000,
         progressCooldownMs: 30000,
       },
+      memoryContextProvider: () => voiceMemoryService.getContext(),
+      rememberFact: async (text) => {
+        const remembered = await voiceMemoryService.rememberFact(text);
+        if (remembered) {
+          emitActivity('memory', `已保存长期记忆：${remembered}`);
+        }
+        return remembered;
+      },
     },
   );
 
   service = { brain, provider, controller };
-  registerVoiceIpc();
 
   if (pttMode) {
     const shortcutRegistered = globalShortcut.register(
@@ -803,28 +1016,24 @@ export const startVoiceService = (): VoiceService | null => {
 
   app.on('before-quit', () => {
     globalShortcut.unregisterAll();
-    clearCaptureRetry();
     captureService?.close();
     captureService = null;
     brain.dispose();
     service = null;
   });
 
-  // Capture is independent of the voice-model session: a Qwen quota/network
-  // failure must not make the microphone look missing. Retry transient
-  // Bluetooth HFP drops inside startCapture().
-  void startCapture(true).catch((error) => {
-    logger.error('[cyrvis capture] startup failed', error);
-  });
-
   // Connect eagerly so the app is listening after launch.
   brain
     .start()
-    .then(() => {
+    .then(async () => {
       logger.info('[cyrvis voice] qwen connected');
+      await startCapture();
     })
     .catch((error) => {
-      logger.error('[cyrvis voice] qwen connect failed', error);
+      logger.error('[cyrvis voice] connect/capture failed', error);
+      broadcast('cyrvis:voice:capture-error', {
+        message: error instanceof Error ? error.message : String(error),
+      });
     });
 
   logger.info('[cyrvis voice] service started');

@@ -5,7 +5,6 @@
 import { app, BrowserWindow } from 'electron';
 
 import { logger } from '@main/logger';
-import * as env from '@main/env';
 
 import { createWindow } from './createWindow';
 
@@ -31,10 +30,11 @@ export function show() {
 
 export function createMainWindow() {
   mainWindow = createWindow({
-    routerPath: '/',
+    routerPath: '/local',
     width: 1200,
     height: 700,
     alwaysOnTop: false,
+    showInBackground: true,
   });
 
   mainWindow.on('close', (event) => {
@@ -44,32 +44,15 @@ export function createMainWindow() {
       return;
     }
 
-    if (env.isMacOS) {
-      event.preventDefault();
-
-      // Black screen on window close in fullscreen mode
-      // https://github.com/electron/electron/issues/20263#issuecomment-633179965
-      if (mainWindow?.isFullScreen()) {
-        mainWindow?.setFullScreen(false);
-
-        mainWindow?.once('leave-full-screen', () => {
-          mainWindow?.hide();
-        });
-      } else {
+    event.preventDefault();
+    if (mainWindow?.isFullScreen()) {
+      mainWindow?.setFullScreen(false);
+      mainWindow?.once('leave-full-screen', () => {
         mainWindow?.hide();
-      }
-      return;
-    }
-
-    if (env.isWindows) {
-      // Keep the voice listener alive in the tray. Quit explicitly from the
-      // tray menu when the user really wants to stop CYRVIS.
-      event.preventDefault();
+      });
+    } else {
       mainWindow?.hide();
-      return;
     }
-
-    mainWindow = null;
   });
 
   return mainWindow;
@@ -80,10 +63,7 @@ export function setContentProtection(enable: boolean) {
 }
 
 export async function showWindow() {
-  mainWindow?.setContentProtection(false);
-  mainWindow?.setIgnoreMouseEvents(false);
-  mainWindow?.show();
-  mainWindow?.restore();
+  await showMainWindow();
 }
 
 export async function hideMainWindow() {
@@ -99,12 +79,16 @@ export async function hideMainWindow() {
 
 export async function showMainWindow() {
   try {
+    if (!mainWindow || mainWindow.isDestroyed()) {
+      mainWindow = createMainWindow();
+    }
     mainWindow?.setContentProtection(false);
-    setTimeout(() => {
-      mainWindow?.setAlwaysOnTop(false);
-    }, 100);
+    mainWindow?.setIgnoreMouseEvents(false);
+    mainWindow?.setAlwaysOnTop(false);
     mainWindow?.setFocusable(true);
+    mainWindow?.restore();
     mainWindow?.show();
+    mainWindow?.focus();
   } catch (error) {
     logger.error('[showMainWindow]', error);
   }

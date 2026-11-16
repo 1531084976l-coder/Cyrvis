@@ -133,11 +133,11 @@ export function useVoiceAudio() {
     window.electron.voice.notifyPlaybackIdle();
   }, []);
 
-  const stopPlayback = useCallback(() => {
+  const stopPlayback = useCallback((notifyIdle = true) => {
     const player = playerRef.current;
     playerRef.current = null;
     if (player) {
-      player.stop();
+      player.stop(notifyIdle);
     }
     setPlaybackActive(false);
   }, []);
@@ -149,13 +149,21 @@ export function useVoiceAudio() {
       }
 
       if (!playerRef.current) {
-        const player = new WavStreamPlayer(finishPlayback, (error) => {
-          const detail =
-            error instanceof Error
-              ? `${error.name}: ${error.message}`
-              : String(error);
-          console.warn('[cyrvis] wav player error', detail);
-        });
+        const player = new WavStreamPlayer(
+          finishPlayback,
+          (error) => {
+            const detail =
+              error instanceof Error
+                ? `${error.name}: ${error.message}`
+                : String(error);
+            console.warn('[cyrvis] wav player error', detail);
+          },
+          (segmentPcm16) => {
+            window.electron.voice.sendPlaybackReference(
+              segmentPcm16.slice().buffer as ArrayBuffer,
+            );
+          },
+        );
         playerRef.current = player;
         if (outputDeviceIdRef.current) {
           void player.setSinkId(outputDeviceIdRef.current).catch((error) => {
@@ -931,7 +939,7 @@ export function useVoiceAudio() {
           window.electron.voice.notifyPlaybackIdle();
         }, 10_000);
         if (!wasSpeaking) {
-          stopPlayback();
+          stopPlayback(false);
         }
       }),
       window.electron.voice.onResponseStopped(() => {
@@ -945,6 +953,12 @@ export function useVoiceAudio() {
           assistantIdleTimerRef.current = null;
         }
         stopPlayback();
+      }),
+      window.electron.voice.onPlaybackPause(() => {
+        playerRef.current?.pause();
+      }),
+      window.electron.voice.onPlaybackResume(() => {
+        playerRef.current?.resume();
       }),
       window.electron.voice.onResponseDone(() => {
         // No audio chunks means this was a tool-call/text-only response; the
@@ -1037,7 +1051,6 @@ export function useVoiceAudio() {
       cleanups.forEach((cleanup) => cleanup());
       void stop();
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   useEffect(() => {

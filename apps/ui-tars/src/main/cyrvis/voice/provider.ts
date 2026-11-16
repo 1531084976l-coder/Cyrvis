@@ -30,6 +30,7 @@ export interface VoiceProviderCallbacks {
  */
 export interface VoiceProvider {
   connect(): Promise<void>;
+  setContext?(context: string): void;
   sendAudio(pcm16: Int16Array): void;
   sendToolResult(callId: string, output: string): void;
   cancelResponse(): void;
