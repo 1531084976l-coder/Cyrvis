@@ -295,6 +295,11 @@ describe('VoiceBrain', () => {
 
     expect(controller.getStatus().status).toBe('cancelled');
     expect(provider.toolResults.at(-1)?.output).toContain('cancelled');
+    // The tool-result response is the single acknowledgment; no proactive
+    // "已停止" line should race it.
+    expect(
+      provider.spoken.filter((text) => text.includes('已停止')),
+    ).toHaveLength(0);
   });
 
   it('blocks a premature completion claim while the GUI task is running', async () => {
@@ -336,6 +341,9 @@ describe('VoiceBrain', () => {
     await new Promise((resolve) => setTimeout(resolve, 0));
 
     expect(controller.getStatus().status).toBe('cancelled');
+    expect(
+      provider.spoken.filter((text) => text.includes('已停止')),
+    ).toHaveLength(0);
   });
 
   it('pauses deterministically on "暂停"', async () => {
@@ -354,6 +362,21 @@ describe('VoiceBrain', () => {
     await new Promise((resolve) => setTimeout(resolve, 0));
 
     expect(controller.getStatus().status).toBe('paused');
+    expect(
+      provider.spoken.filter((text) => text.includes('已暂停')),
+    ).toHaveLength(0);
+  });
+
+  it('ignores a short self-echo transcript while the assistant is speaking', async () => {
+    const { brain, provider } = setup({ requireWakeWord: false });
+    await brain.start();
+    provider.callbacks.onResponseStarted?.();
+    provider.emitAudio(new Int16Array(320));
+    provider.callbacks.onAssistantText?.('我在呢，随时待命。', true);
+    provider.emitTranscript('我在', true);
+    await flush();
+
+    expect(provider.canceled).toBeGreaterThan(0);
   });
 
   it('sleeps after the awake timeout', async () => {

@@ -138,24 +138,42 @@
 | 任务停得慢 | `transcript` → `Request was aborted` / `user_stopped` 的时间差 |
 | AirPods 断开 | `devicechange` → 自动 `restart-capture`；重新连上即可 |
 
-## 9. 输出模式切换（耳机 / 外放）
+## 9. 两种模式：耳机 / 外放
 
-语音条右侧有 **耳机 / 外放** 按钮，点击即可切换；外放模式自动半双工。
+语音条的 **耳机 / 外放** 按钮是主控，一键切换整套路由：
 
-| 模式 | 输出 | 采集 | 语音打断 |
+| 模式 | 麦克风 | 扬声器输出 | 语音打断 |
 |---|---|---|---|
-| 耳机 | AirPods / 默认耳机 | 无 AEC | **可用**（阈值 1000 / 150ms） |
-| 外放 | 扬声器 / Realtek | AEC（尝试） | **不可用**，用 `Ctrl+Alt+X` / Interrupt |
+| 耳机 | 蓝牙耳机麦克风 | 蓝牙耳机本身 | **可用**（阈值 1000 / 150ms） |
+| 外放 | 蓝牙耳机麦克风 | 主机 Realtek 扬声器 | **可用**（阈值 2000 / 180ms；`Ctrl+Alt+X` 兜底） |
 
-外放模式是半双工：
+切换模式时 App 自动做三件事：
 
-- 播放期间**丢弃**采集 PCM；
-- 播放结束后再丢弃 **800ms**，吸收房间混响；
-- 避免“它听到自己的外放 → 一直你好”的反馈循环。
+1. 用 `scripts/cyrvis/audio/set-default-output.ps1` 切换 **Windows 默认播放端点**（耳机 → Bluetooth A2DP；外放 → Realtek 模拟扬声器）；
+2. 把主窗口 `<audio>` 的 `setSinkId` 切到同一设备；
+3. 重启隐藏采集窗口，但**不改变麦克风**，始终优先物理耳机麦克风。
 
-AEC 实测结论：隐藏采集窗口开启 `echoCancellation:true` 后，播放期间仍收到自己的外放（`barge-in avg=8640`）——因为该渲染进程没有主窗口播放的参考信号。因此外放模式保留 AEC 但**不启用语音打断**；要同时外放+语音打断，需要系统级回声参考/软件 AEC，或换带杆麦克风（见 roadmap/待验证方案）。
+之所以要同时改 Windows 默认端点：实测 Windows 会把 Electron 的整条音频会话留在蓝牙耳机上，单靠 `HTMLMediaElement.setSinkId(Realtek)` 有时不生效；默认端点切到 Realtek 后，试听/播报稳定走主机扬声器。
 
-切回耳机模式后，语音打断立即恢复；两种模式可自由切换。
+外放 + 语音打断的工作方式：
+
+- 播放期间**不把 PCM 送 ASR**，但持续做本地能量检测；
+- 连续超过阈值 180ms 即触发 `bargeIn()`，回灌最近 600ms 预录音频，让 ASR 拿到“停/别说了”的开头；
+- 播放结束后只保留 **100ms** 尾音保护，不再半双工丢 800ms；
+- 阈值可用 `CYRVIS_SPEAKER_BARGE_THRESHOLD` 覆盖（默认 2000）。外放串音高时调高；入耳麦/带杆麦通常串音低。
+
+自听保护（防止“我一直我在”）：
+
+- 每次回复开头 **600ms** 测麦克风串音；平均电平 > `CYRVIS_SPEAKER_ECHO_GUARD`（默认 1500）时，认为外放串音过大，**本次回复自动禁用语音打断**，让话说完；`Ctrl+Alt+X` / Interrupt 仍可用。下一次回复重新探测，环境变好（音量降低/换麦）会自动恢复语音打断。
+- 即使 barge 已触发，如果 ASR 返回的是“我在/我来/我/在听”等与助手上一句高度重合的短转写，VoiceBrain 会判定为自听并丢弃，不再让模型自问自答。
+
+高级控件：
+
+- **输出设备下拉框**：手动覆盖模式预设；日常用模式按钮即可；
+- **试听**：在当前选中的设备上播放 1 秒 440Hz 测试音，用于确认物理接口；
+- 模式和设备分别持久化到 `localStorage`，重启后恢复。
+
+> 历史结论仍成立：隐藏采集窗口开 `echoCancellation:true` 无法消除主窗口播放（实测 `barge-in avg=8640`），所以外放模式改为“无 AEC + 更高能量阈值”，不再依赖 AEC。外放+语音打断最好使用入耳麦或带杆麦克风；若扬声器串音导致误触发，调高阈值或使用 `Ctrl+Alt+X`。
 
 ### 任意输出设备（调试）
 
@@ -217,3 +235,19 @@ await window.__cyrvisResetOutput();
 | 用户说“停”时的电平 | 明显高于串音 |
 | 建议阈值 | 串音与人声之间，持续 150ms |
 | 失败回退 | 外放半双工 + Ctrl+Alt+X |
+
+## 12. 语音模型配置（2026-11-16）
+
+Token Plan 的 `sk-sp-…` Key 不能走公共 DashScope，必须使用独立 host：
+
+```env
+QWEN_MODEL=qwen-audio-3.0-realtime-plus
+QWEN_VOICE=longanqian
+QWEN_REALTIME_URL=wss://token-plan.maas.qianwenaiapi.com/api-ws/v1/realtime?model=qwen-audio-3.0-realtime-plus
+```
+
+- 模型列表：`GET https://token-plan.maas.qianwenaiapi.com/compatible-mode/v1/models`。
+- Token Plan 当前只提供 `qwen-audio-3.0-realtime-plus`，没有 flash。
+- 实测 App 兼容会话（`turn_detection:null`、16k 输入/24k 输出 PCM、tools）返回 `session.updated`；文本转语音返回 5 个 `response.audio.delta`、96000 字节 PCM（约 2 秒）。
+- 同 host 的 `/v1/realtime`、`/ws/v1/realtime`、`/realtime` 为 404；`/compatible-mode/v1/realtime` 可握手，但 App 使用 DashScope 协议，配置 `/api-ws/v1/realtime`。
+- 日志出现 `qwen session ready` → `qwen connected` → `wake` 即表示语音链路已连上；采集仍要求 Windows 存在物理麦克风，`ToDesk Virtual Audio` 会被拒绝。

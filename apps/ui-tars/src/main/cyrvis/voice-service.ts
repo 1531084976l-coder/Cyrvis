@@ -2,7 +2,9 @@
  * Copyright (c) 2025 Bytedance, Inc. and its affiliates.
  * SPDX-License-Identifier: Apache-2.0
  */
+import { execFile } from 'node:child_process';
 import fs from 'node:fs';
+import path from 'node:path';
 
 import { app, BrowserWindow, globalShortcut, ipcMain } from 'electron';
 
@@ -25,17 +27,34 @@ interface VoiceService {
 let service: VoiceService | null = null;
 let captureService: CaptureService | null = null;
 let captureReady = false;
+let captureGeneration = 0;
+let captureRetryTimer: ReturnType<typeof setTimeout> | null = null;
+let captureRetryAttempts = 0;
 let assistantPlaybackActive = false;
 let captureBargeMs = 0;
 let capturePreroll: Int16Array[] = [];
 let lastCaptureLogAt = 0;
 // Two selectable audio modes:
-// - headset: capture without AEC + full voice barge-in (verified)
-// - speaker: external output + AEC capture; barge-in is attempted with a
-//   higher threshold, and a short post-playback guard absorbs reverb.
+// - headset: capture without AEC + voice barge-in (verified)
+// - speaker: external output + voice barge-in with a higher energy threshold.
+//   The capture renderer has no AEC reference, so raw mic + threshold is used;
+//   a short post-playback guard only absorbs reverb.
 let audioMode: 'headset' | 'speaker' = 'headset';
 let speakerOutputMode = false;
 let speakerGuardUntil = 0;
+let speakerBargeSuppressed = false;
+let speakerProbePending = false;
+let speakerProbeUntil = 0;
+let speakerProbeSum = 0;
+let speakerProbeCount = 0;
+let speakerProbeMax = 0;
+// Rolling mic energy during speaker playback. The median approximates the
+// current speaker leakage floor: high while TTS is loud, low in pauses. Barge
+// is allowed when the user is clearly louder than that floor.
+let speakerLeakWindow: number[] = [];
+// Once leakage/self-echo is observed, raise the barge threshold for a cooldown
+// instead of disabling voice interruption entirely.
+let speakerEchoUntil = 0;
 let ipcRegistered = false;
 let testAudioActive = false;
 let pttActive = false;
@@ -44,6 +63,85 @@ let pttMode = false;
 
 const CAPTURE_BARGE_THRESHOLD = 1000;
 const CAPTURE_BARGE_SUSTAIN_MS = 150;
+// External speakers + an in-ear mic: keep listening during playback so voice
+// barge-in works. The threshold is higher because speaker leakage is possible.
+const SPEAKER_BARGE_THRESHOLD = Number(
+  process.env.CYRVIS_SPEAKER_BARGE_THRESHOLD || 2000,
+);
+const SPEAKER_BARGE_SUSTAIN_MS = 180;
+// Measure the mic during the first 1200ms of *actual playback* (not from
+// response.created, which can arrive before any audio). If the speaker leaks
+// into the mic, voice barge is unreliable and would make the model answer its
+// own audio; suppress barge and let the reply finish.
+const SPEAKER_ECHO_GUARD = Number(
+  process.env.CYRVIS_SPEAKER_ECHO_GUARD || 1500,
+);
+const SPEAKER_ECHO_PROBE_MS = 1200;
+const SPEAKER_ECHO_COOLDOWN_MS = 60_000;
+const SPEAKER_LEAK_WINDOW_CHUNKS = 25; // ~500ms of 20ms chunks
+const SPEAKER_LEAK_FACTOR = 4;
+const SPEAKER_GATED_BARGE_THRESHOLD = 2500;
+
+const AUDIO_SCRIPT_CANDIDATES = () => [
+  path.resolve(
+    app.getAppPath(),
+    '../../scripts/cyrvis/audio/set-default-output.ps1',
+  ),
+  path.resolve(process.cwd(), 'scripts/cyrvis/audio/set-default-output.ps1'),
+  path.resolve(
+    process.cwd(),
+    '../../scripts/cyrvis/audio/set-default-output.ps1',
+  ),
+];
+
+const findAudioScript = (): string | null =>
+  AUDIO_SCRIPT_CANDIDATES().find((candidate) => fs.existsSync(candidate)) ??
+  null;
+
+/**
+ * Windows sometimes keeps the Electron audio session on the Bluetooth headset
+ * even when <audio>.setSinkId() names the Realtek endpoint. Switching the
+ * Windows default endpoint per voice mode makes both paths agree.
+ */
+const switchWindowsDefaultOutput = async (
+  kind: 'headset' | 'speaker',
+): Promise<void> => {
+  const script = findAudioScript();
+  if (!script) {
+    logger.warn('[cyrvis voice] audio endpoint script not found');
+    return;
+  }
+  await new Promise<void>((resolve) => {
+    execFile(
+      'powershell.exe',
+      [
+        '-NoProfile',
+        '-ExecutionPolicy',
+        'Bypass',
+        '-File',
+        script,
+        '-Kind',
+        kind,
+      ],
+      { timeout: 15_000, windowsHide: true },
+      (error, stdout, stderr) => {
+        if (error) {
+          logger.error('[cyrvis voice] switch default output failed', {
+            kind,
+            error: error.message,
+            stderr: stderr?.trim(),
+          });
+        } else {
+          logger.info('[cyrvis voice] default output switched', {
+            kind,
+            result: stdout.trim(),
+          });
+        }
+        resolve();
+      },
+    );
+  });
+};
 
 /**
  * Microphone audio comes from a hidden renderer that never plays audio.
@@ -56,8 +154,13 @@ const handleCapturePcm = (pcm16: Int16Array): void => {
   }
 
   let sum = 0;
+  let peak = 0;
   for (let i = 0; i < pcm16.length; i += 1) {
-    sum += Math.abs(pcm16[i]);
+    const value = Math.abs(pcm16[i]);
+    sum += value;
+    if (value > peak) {
+      peak = value;
+    }
   }
   const average = sum / pcm16.length;
 
@@ -66,41 +169,90 @@ const handleCapturePcm = (pcm16: Int16Array): void => {
     lastCaptureLogAt = now;
     logger.info('[cyrvis capture] level', {
       avg: Math.round(average),
+      peak,
       playing: assistantPlaybackActive,
       mode: audioMode,
     });
   }
 
-  if (speakerOutputMode) {
-    // AEC in the hidden capture renderer has no reference to the main
-    // window's playback (measured self-audio 8640 during playback), so
-    // speaker mode stays half-duplex: ignore the mic while playing, plus a
-    // short reverb guard. Voice barge-in is only available in headset mode.
-    if (assistantPlaybackActive || now < speakerGuardUntil) {
-      return;
-    }
-    service.provider.sendAudio(pcm16);
-    return;
-  }
-
+  // Keep a 600ms pre-roll in both modes so the beginning of "停" is not lost.
   capturePreroll.push(pcm16.slice());
-  const prerollLimit = speakerOutputMode ? 15 : 30;
-  if (capturePreroll.length > prerollLimit) {
+  if (capturePreroll.length > 30) {
     capturePreroll.shift();
   }
 
   if (assistantPlaybackActive) {
+    if (speakerOutputMode) {
+      speakerLeakWindow.push(average);
+      if (speakerLeakWindow.length > SPEAKER_LEAK_WINDOW_CHUNKS) {
+        speakerLeakWindow.shift();
+      }
+    }
+    if (speakerOutputMode && speakerProbeUntil > 0) {
+      if (now < speakerProbeUntil) {
+        speakerProbeSum += average;
+        speakerProbeCount += 1;
+        if (average > speakerProbeMax) {
+          speakerProbeMax = average;
+        }
+        captureBargeMs = 0;
+        return;
+      }
+      const probeAvg = speakerProbeSum / Math.max(1, speakerProbeCount);
+      speakerProbeUntil = 0;
+      if (
+        probeAvg > SPEAKER_ECHO_GUARD ||
+        speakerProbeMax > SPEAKER_ECHO_GUARD * 2
+      ) {
+        speakerBargeSuppressed = true;
+        speakerEchoUntil = now + SPEAKER_ECHO_COOLDOWN_MS;
+        logger.warn('[cyrvis voice] high speaker leakage; barge gated', {
+          avg: Math.round(probeAvg),
+          max: Math.round(speakerProbeMax),
+          guard: SPEAKER_ECHO_GUARD,
+          cooldownMs: SPEAKER_ECHO_COOLDOWN_MS,
+        });
+      } else {
+        logger.info('[cyrvis voice] speaker leakage acceptable', {
+          avg: Math.round(probeAvg),
+          max: Math.round(speakerProbeMax),
+        });
+      }
+    }
     const chunkMs = (pcm16.length / 16000) * 1000;
-    if (average > CAPTURE_BARGE_THRESHOLD) {
+    let threshold = speakerOutputMode
+      ? SPEAKER_BARGE_THRESHOLD
+      : CAPTURE_BARGE_THRESHOLD;
+    let leakFloor = 0;
+    if (speakerOutputMode) {
+      // While TTS is loud the mic is dominated by speaker leakage; while it is
+      // between words the floor drops. Requiring the user to be clearly above
+      // the local floor lets "停" work in pauses without false triggers.
+      const sorted = [...speakerLeakWindow].sort((a, b) => a - b);
+      leakFloor = sorted[Math.floor(sorted.length / 2)] ?? 0;
+      threshold = Math.max(
+        threshold,
+        leakFloor * SPEAKER_LEAK_FACTOR,
+        speakerBargeSuppressed ? SPEAKER_GATED_BARGE_THRESHOLD : 0,
+      );
+    }
+    const sustainMs = speakerOutputMode
+      ? SPEAKER_BARGE_SUSTAIN_MS
+      : CAPTURE_BARGE_SUSTAIN_MS;
+    if (average > threshold) {
       captureBargeMs += chunkMs;
     } else {
       captureBargeMs = Math.max(0, captureBargeMs - chunkMs);
     }
-    if (captureBargeMs >= CAPTURE_BARGE_SUSTAIN_MS) {
+    if (captureBargeMs >= sustainMs) {
       logger.info('[cyrvis capture] barge-in', {
         avg: Math.round(average),
+        mode: audioMode,
+        threshold: Math.round(threshold),
+        leakFloor: Math.round(leakFloor),
       });
       assistantPlaybackActive = false;
+      speakerGuardUntil = 0;
       captureBargeMs = 0;
       const buffered = capturePreroll.splice(0);
       service.provider.bargeIn();
@@ -113,33 +265,98 @@ const handleCapturePcm = (pcm16: Int16Array): void => {
     return;
   }
 
+  // A very short reverb guard only; do not drop the mic for 800ms after TTS.
+  if (speakerOutputMode && now < speakerGuardUntil) {
+    return;
+  }
   captureBargeMs = 0;
   service.provider.sendAudio(pcm16);
 };
 
-const startCapture = async (): Promise<void> => {
+const clearCaptureRetry = () => {
+  if (captureRetryTimer) {
+    clearTimeout(captureRetryTimer);
+    captureRetryTimer = null;
+  }
+};
+
+const scheduleCaptureRetry = (message: string) => {
+  if (captureRetryTimer || captureRetryAttempts >= 3) {
+    return;
+  }
+  if (!/No physical microphone|Microphone disconnected/i.test(message)) {
+    return;
+  }
+  captureRetryAttempts += 1;
+  const delay = 1200;
+  logger.warn('[cyrvis capture] retrying', {
+    attempt: captureRetryAttempts,
+    delay,
+    message,
+  });
+  captureRetryTimer = setTimeout(() => {
+    captureRetryTimer = null;
+    void startCapture().catch((error) => {
+      logger.error('[cyrvis capture] retry failed', error);
+    });
+  }, delay);
+};
+
+const startCapture = async (resetRetries = false): Promise<void> => {
+  if (resetRetries) {
+    captureRetryAttempts = 0;
+    clearCaptureRetry();
+  }
+  const generation = ++captureGeneration;
   captureService?.close();
   captureService = null;
   captureReady = false;
-  captureService = await startCaptureService(
-    {
-      onPcm: handleCapturePcm,
-      onReady: (label) => {
-        captureReady = true;
-        logger.info('[cyrvis capture] ready', {
-          label,
-          mode: audioMode,
-        });
-        broadcast('cyrvis:voice:capture-ready', { label });
+  try {
+    captureService = await startCaptureService(
+      {
+        onPcm: (pcm16) => {
+          if (generation === captureGeneration) {
+            handleCapturePcm(pcm16);
+          }
+        },
+        onReady: (label) => {
+          if (generation !== captureGeneration) {
+            return;
+          }
+          captureReady = true;
+          captureRetryAttempts = 0;
+          clearCaptureRetry();
+          logger.info('[cyrvis capture] ready', {
+            label,
+            mode: audioMode,
+          });
+          broadcast('cyrvis:voice:capture-ready', { label });
+        },
+        onError: (message) => {
+          if (generation !== captureGeneration) {
+            return;
+          }
+          captureReady = false;
+          logger.error('[cyrvis capture] error', { message });
+          broadcast('cyrvis:voice:capture-error', { message });
+          scheduleCaptureRetry(message);
+        },
       },
-      onError: (message) => {
-        captureReady = false;
-        logger.error('[cyrvis capture] error', { message });
-        broadcast('cyrvis:voice:capture-error', { message });
-      },
-    },
-    { echoCancellation: speakerOutputMode },
-  );
+      // The hidden capture renderer has no reference to the main window's
+      // playback, so AEC cannot cancel external speakers. Keep the mic raw and
+      // use the energy threshold above for barge-in instead.
+      { echoCancellation: false },
+    );
+  } catch (error) {
+    if (generation === captureGeneration) {
+      captureReady = false;
+      const message = error instanceof Error ? error.message : String(error);
+      logger.error('[cyrvis capture] start failed', { message });
+      broadcast('cyrvis:voice:capture-error', { message });
+      scheduleCaptureRetry(message);
+    }
+    throw error;
+  }
 };
 
 const broadcast = (channel: string, payload?: unknown) => {
@@ -161,6 +378,9 @@ const triggerBargeIn = () => {
   logger.info('[cyrvis voice] barge-in');
   assistantPlaybackActive = false;
   captureBargeMs = 0;
+  speakerBargeSuppressed = false;
+  speakerProbeUntil = 0;
+  speakerLeakWindow = [];
   service.provider.bargeIn();
   service.brain.forceAwake();
   broadcast('cyrvis:voice:response-stopped');
@@ -307,20 +527,32 @@ const registerVoiceIpc = () => {
       return { ok: false, error: 'mode must be headset or speaker' };
     }
     const nextMode = mode as 'headset' | 'speaker';
+    await switchWindowsDefaultOutput(nextMode);
     const changed = audioMode !== nextMode;
     audioMode = nextMode;
     speakerOutputMode = nextMode === 'speaker';
     speakerGuardUntil = 0;
+    speakerBargeSuppressed = false;
+    speakerProbePending = false;
+    speakerProbeUntil = 0;
+    speakerEchoUntil = 0;
+    speakerLeakWindow = [];
     captureBargeMs = 0;
     capturePreroll = [];
     logger.info('[cyrvis voice] audio mode', {
       mode: audioMode,
-      echoCancellation: speakerOutputMode,
+      echoCancellation: false,
+      bargeThreshold: speakerOutputMode
+        ? SPEAKER_BARGE_THRESHOLD
+        : CAPTURE_BARGE_THRESHOLD,
     });
     broadcast('cyrvis:voice:audio-mode', { mode: audioMode });
     if (changed) {
+      // Bluetooth profile/A2DP switches briefly drop the HFP microphone.
+      // Give Windows time to settle before opening the hidden capture window.
+      await new Promise((resolve) => setTimeout(resolve, 500));
       try {
-        await startCapture();
+        await startCapture(true);
       } catch (error) {
         logger.error('[cyrvis capture] mode switch failed', error);
       }
@@ -334,34 +566,17 @@ const registerVoiceIpc = () => {
     if (typeof label !== 'string' || !label.trim()) {
       return { ok: false, error: 'output label is required' };
     }
-    const nextMode = /扬声器|speaker|realtek|nvidia|显示器|display/i.test(label)
-      ? 'speaker'
-      : 'headset';
-    const changed = audioMode !== nextMode;
-    audioMode = nextMode;
-    speakerOutputMode = nextMode === 'speaker';
-    if (speakerOutputMode) {
-      speakerGuardUntil = 0;
-      captureBargeMs = 0;
-      capturePreroll = [];
-    }
-    logger.info('[cyrvis voice] output mode', {
-      label,
-      speaker: speakerOutputMode,
-    });
-    broadcast('cyrvis:voice:audio-mode', { mode: audioMode });
+    // Output device and voice mode are independent on purpose: the user can
+    // route audio to external speakers while keeping headset/full-duplex mode
+    // and voice barge-in (e.g. an in-ear mic + external speakers).
+    logger.info('[cyrvis voice] output label', { label, mode: audioMode });
     broadcast('cyrvis:voice:set-output', label);
-    if (changed) {
-      void startCapture().catch((error) => {
-        logger.error('[cyrvis capture] output mode restart failed', error);
-      });
-    }
-    return { ok: true, speaker: speakerOutputMode, mode: audioMode };
+    return { ok: true, mode: audioMode, speaker: speakerOutputMode };
   });
 
   ipcMain.handle('cyrvis:voice:restart-capture', async () => {
     try {
-      await startCapture();
+      await startCapture(true);
       return { ok: true };
     } catch (error) {
       logger.error('[cyrvis capture] restart failed', error);
@@ -375,7 +590,11 @@ const registerVoiceIpc = () => {
   ipcMain.on('cyrvis:voice:playback-idle', () => {
     assistantPlaybackActive = false;
     captureBargeMs = 0;
-    speakerGuardUntil = speakerOutputMode ? Date.now() + 800 : 0;
+    speakerBargeSuppressed = false;
+    speakerProbePending = false;
+    speakerProbeUntil = 0;
+    speakerLeakWindow = [];
+    speakerGuardUntil = speakerOutputMode ? Date.now() + 100 : 0;
     service?.provider.notifyPlaybackIdle();
   });
 
@@ -445,6 +664,18 @@ export const startVoiceService = (): VoiceService | null => {
       },
       onTaskEvent: (event: ControllerEvent) =>
         broadcast('cyrvis:voice:task-event', event),
+      onSelfEcho: () => {
+        if (speakerOutputMode) {
+          speakerBargeSuppressed = true;
+          speakerProbePending = false;
+          speakerProbeUntil = 0;
+          speakerEchoUntil = Date.now() + SPEAKER_ECHO_COOLDOWN_MS;
+          logger.warn(
+            '[cyrvis voice] self-echo; speaker barge gated',
+            { cooldownMs: SPEAKER_ECHO_COOLDOWN_MS },
+          );
+        }
+      },
       onError: (error) => logger.error('[cyrvis voice] error', error),
     },
     (callbacks) => {
@@ -463,12 +694,35 @@ export const startVoiceService = (): VoiceService | null => {
           captureBargeMs = 0;
           capturePreroll = [];
           speakerGuardUntil = 0;
+          speakerBargeSuppressed =
+            speakerOutputMode && Date.now() < speakerEchoUntil;
+          speakerProbePending =
+            speakerOutputMode && !speakerBargeSuppressed;
+          speakerProbeUntil = 0;
+          speakerProbeSum = 0;
+          speakerProbeCount = 0;
+          speakerProbeMax = 0;
+          speakerLeakWindow = [];
           if (speakerOutputMode) {
             // Drop any residual speaker/TTS audio still in the ASR buffer.
             service?.provider.clearAudioBuffer();
           }
           broadcast('cyrvis:voice:response-started');
           callbacks.onResponseStarted?.();
+        },
+        onAudio: (pcm16: Int16Array) => {
+          // Probe starts with the first *audible* chunk, not response.created:
+          // generation can take hundreds of ms, so an earlier probe only sees
+          // silence and misses the speaker leakage entirely.
+          if (speakerOutputMode && speakerProbePending) {
+            speakerProbePending = false;
+            speakerProbeUntil = Date.now() + SPEAKER_ECHO_PROBE_MS;
+            speakerProbeSum = 0;
+            speakerProbeCount = 0;
+            speakerProbeMax = 0;
+            service?.provider.clearAudioBuffer();
+          }
+          callbacks.onAudio?.(pcm16);
         },
         onResponseDone: () => {
           // Tool-call-only responses produce no audio. Tell the renderer so
@@ -502,6 +756,8 @@ export const startVoiceService = (): VoiceService | null => {
       provider = new QwenOmniProvider({
         apiKey,
         model: process.env.QWEN_MODEL || 'qwen3.8-omni-flash-realtime',
+        endpoint: process.env.QWEN_REALTIME_URL || undefined,
+        voice: process.env.QWEN_VOICE || undefined,
         callbacks: wrapped,
         vadType: 'semantic_vad_ec',
         // 1.2s felt like the assistant was deaf: users repeat "Hello" before
@@ -547,24 +803,28 @@ export const startVoiceService = (): VoiceService | null => {
 
   app.on('before-quit', () => {
     globalShortcut.unregisterAll();
+    clearCaptureRetry();
     captureService?.close();
     captureService = null;
     brain.dispose();
     service = null;
   });
 
+  // Capture is independent of the voice-model session: a Qwen quota/network
+  // failure must not make the microphone look missing. Retry transient
+  // Bluetooth HFP drops inside startCapture().
+  void startCapture(true).catch((error) => {
+    logger.error('[cyrvis capture] startup failed', error);
+  });
+
   // Connect eagerly so the app is listening after launch.
   brain
     .start()
-    .then(async () => {
+    .then(() => {
       logger.info('[cyrvis voice] qwen connected');
-      await startCapture();
     })
     .catch((error) => {
-      logger.error('[cyrvis voice] connect/capture failed', error);
-      broadcast('cyrvis:voice:capture-error', {
-        message: error instanceof Error ? error.message : String(error),
-      });
+      logger.error('[cyrvis voice] qwen connect failed', error);
     });
 
   logger.info('[cyrvis voice] service started');

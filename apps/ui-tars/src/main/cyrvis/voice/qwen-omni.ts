@@ -16,6 +16,9 @@ import { CYRVIS_VOICE_TOOLS, type QwenToolDefinition } from './tools';
 
 export type QwenVadType = 'server_vad' | 'semantic_vad' | 'semantic_vad_ec';
 
+// Keep well below the server's 30s cap; only trim while nobody is speaking.
+const INPUT_BUFFER_TRIM_MS = 15_000;
+
 export interface QwenOmniConfig {
   apiKey: string;
   model?: string;
@@ -72,11 +75,20 @@ export class QwenOmniProvider implements VoiceProvider {
   private pendingToolResults: Array<{ callId: string; output: string }> = [];
   private pendingSpeak: string | null = null;
   private toolResultFallback: ReturnType<typeof setTimeout> | null = null;
+  private playbackFallback: ReturnType<typeof setTimeout> | null = null;
+  // True from the first audio delta until the renderer reports that the WAV
+  // queue is empty. A new tool result / proactive line must wait for this;
+  // otherwise it starts a second response and cuts the first one mid-word.
+  private playbackBusy = false;
   private micMuteUntil = 0;
   private responseAudioBytes = 0;
   private suppressAudio = false;
   private forceNextCommit = false;
   private audioChunkCount = 0;
+  // Qwen Audio 3.x rejects a continuous input buffer after 30s. The local VAD
+  // only commits after speech, so idle room noise can otherwise fill the
+  // buffer and kill the session mid-conversation.
+  private bufferedAudioMs = 0;
   private readyEmitted = false;
   private manualClose = false;
   private reconnectAttempts = 0;
@@ -134,12 +146,15 @@ export class QwenOmniProvider implements VoiceProvider {
     }
     this.connected = false;
     this.localSpeechActive = false;
+    this.bufferedAudioMs = 0;
     this.responseActive = false;
     this.awaitingResponse = false;
     this.activeResponseId = null;
     this.pendingToolResults = [];
     this.pendingSpeak = null;
+    this.playbackBusy = false;
     this.clearToolResultFallback();
+    this.clearPlaybackFallback();
 
     return new Promise<void>((resolve, reject) => {
       const timer = setTimeout(() => {
@@ -192,6 +207,17 @@ export class QwenOmniProvider implements VoiceProvider {
       return;
     }
 
+    const chunkMs = (pcm16.length / 16000) * 1000;
+    if (
+      !this.localSpeechActive &&
+      this.bufferedAudioMs + chunkMs > INPUT_BUFFER_TRIM_MS
+    ) {
+      console.log('[cyrvis provider] input buffer trim', {
+        bufferedMs: Math.round(this.bufferedAudioMs),
+      });
+      this.clearAudioBuffer();
+    }
+
     const audio = Buffer.from(
       pcm16.buffer,
       pcm16.byteOffset,
@@ -203,6 +229,7 @@ export class QwenOmniProvider implements VoiceProvider {
       type: 'input_audio_buffer.append',
       audio,
     });
+    this.bufferedAudioMs += chunkMs;
 
     this.audioChunkCount += 1;
     if (this.audioChunkCount === 1 || this.audioChunkCount % 100 === 0) {
@@ -224,10 +251,11 @@ export class QwenOmniProvider implements VoiceProvider {
       return;
     }
 
-    if (this.awaitingResponse) {
+    if (this.awaitingResponse || this.playbackBusy) {
       this.pendingToolResults.push({ callId, output });
       console.log('[cyrvis provider] tool result queued', {
         queue: this.pendingToolResults.length,
+        playbackBusy: this.playbackBusy,
       });
       this.armToolResultFallback();
       return;
@@ -240,6 +268,7 @@ export class QwenOmniProvider implements VoiceProvider {
     this.localSpeechActive = false;
     this.localSpeechMs = 0;
     this.localSilenceMs = 0;
+    this.bufferedAudioMs = 0;
     this.send({
       event_id: eventId('event_clear'),
       type: 'input_audio_buffer.clear',
@@ -251,7 +280,13 @@ export class QwenOmniProvider implements VoiceProvider {
     // Short tail only. While the assistant speaks we detect barge-in locally
     // in the renderer, so the mic must reopen promptly when playback ends.
     this.micMuteUntil = Date.now() + 150;
+    this.playbackBusy = false;
+    this.clearPlaybackFallback();
+    this.callbacks.onPlaybackIdle?.();
     console.log('[cyrvis provider] playback idle; mic re-enabled');
+    // A tool result or proactive line queued behind the previous audio can
+    // now start without overlapping it.
+    this.pumpResponseQueue();
   }
 
   /**
@@ -290,7 +325,9 @@ export class QwenOmniProvider implements VoiceProvider {
     this.activeResponseId = null;
     this.pendingSpeak = null;
     this.pendingToolResults = [];
+    this.playbackBusy = false;
     this.clearToolResultFallback();
+    this.clearPlaybackFallback();
     this.send({
       event_id: eventId('event_cancel'),
       type: 'response.cancel',
@@ -309,9 +346,11 @@ export class QwenOmniProvider implements VoiceProvider {
       return;
     }
 
-    if (this.awaitingResponse) {
+    if (this.awaitingResponse || this.playbackBusy) {
       this.pendingSpeak = text;
-      console.log('[cyrvis provider] proactive speech queued');
+      console.log('[cyrvis provider] proactive speech queued', {
+        playbackBusy: this.playbackBusy,
+      });
       return;
     }
 
@@ -356,7 +395,7 @@ export class QwenOmniProvider implements VoiceProvider {
   }
 
   private pumpResponseQueue(): void {
-    if (!this.connected || this.awaitingResponse) {
+    if (!this.connected || this.awaitingResponse || this.playbackBusy) {
       return;
     }
 
@@ -395,6 +434,33 @@ export class QwenOmniProvider implements VoiceProvider {
     }
   }
 
+  private armPlaybackFallback(): void {
+    this.clearPlaybackFallback();
+    // The renderer normally reports playback-idle. This watchdog prevents a
+    // permanently queued tool result if the renderer/audio element dies.
+    const audioMs = (this.responseAudioBytes / (24000 * 2)) * 1000;
+    this.playbackFallback = setTimeout(
+      () => {
+        this.playbackFallback = null;
+        if (!this.playbackBusy) {
+          return;
+        }
+        console.warn('[cyrvis provider] playback idle fallback');
+        this.playbackBusy = false;
+        this.callbacks.onPlaybackIdle?.();
+        this.pumpResponseQueue();
+      },
+      Math.max(5000, audioMs + 3000),
+    );
+  }
+
+  private clearPlaybackFallback(): void {
+    if (this.playbackFallback) {
+      clearTimeout(this.playbackFallback);
+      this.playbackFallback = null;
+    }
+  }
+
   close(): void {
     this.manualClose = true;
     if (this.reconnectTimer) {
@@ -410,7 +476,9 @@ export class QwenOmniProvider implements VoiceProvider {
     this.activeResponseId = null;
     this.pendingToolResults = [];
     this.pendingSpeak = null;
+    this.playbackBusy = false;
     this.clearToolResultFallback();
+    this.clearPlaybackFallback();
     this.ws?.close();
     this.ws = null;
   }
@@ -541,6 +609,7 @@ export class QwenOmniProvider implements VoiceProvider {
           this.responseAudioBytes += bytes;
           if (this.responseAudioBytes <= bytes) {
             console.log('[cyrvis provider] first audio delta', { bytes });
+            this.playbackBusy = true;
           }
           this.callbacks.onAudio?.(toInt16(event.delta));
         }
@@ -574,6 +643,8 @@ export class QwenOmniProvider implements VoiceProvider {
           // A canceled response must not re-mute the mic: the user is
           // interrupting and their next words need to be captured now.
           this.micMuteUntil = 0;
+          this.playbackBusy = false;
+          this.clearPlaybackFallback();
           console.log('[cyrvis provider] canceled response done');
           this.callbacks.onResponseDone?.();
           this.pumpResponseQueue();
@@ -587,23 +658,40 @@ export class QwenOmniProvider implements VoiceProvider {
           audioBytes: this.responseAudioBytes,
           status: doneStatus,
         });
+        if (this.responseAudioBytes > 0) {
+          this.playbackBusy = true;
+          this.armPlaybackFallback();
+        } else {
+          this.playbackBusy = false;
+        }
         this.callbacks.onResponseDone?.();
         this.restoreInstructionsIfNeeded();
         this.pumpResponseQueue();
         break;
       }
-      case 'error':
+      case 'error': {
+        const message = JSON.stringify(event.error || event).slice(0, 1000);
         if (!this.cancelRequested) {
-          this.callbacks.onError?.(
-            new Error(
-              JSON.stringify(event.error || event, null, 2).slice(0, 1000),
-            ),
-          );
+          this.callbacks.onError?.(new Error(message));
         }
-        this.failConnect(
-          new Error(JSON.stringify(event.error || event).slice(0, 1000)),
-        );
+        this.failConnect(new Error(message));
+        // A server-side error invalidates the session state (observed with the
+        // 30s input-buffer limit). Keeping the socket open makes every queued
+        // append fail and floods the log; reset the session instead.
+        this.connected = false;
+        this.localSpeechActive = false;
+        this.bufferedAudioMs = 0;
+        if (this.ws) {
+          try {
+            this.ws.close();
+          } catch {
+            // already closed
+          }
+          this.ws = null;
+        }
+        this.scheduleReconnect();
         break;
+      }
       default:
         break;
     }

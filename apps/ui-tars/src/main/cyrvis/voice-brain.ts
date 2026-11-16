@@ -31,6 +31,8 @@ export interface VoiceBrainCallbacks {
   onWake?: () => void;
   onSleep?: () => void;
   onTaskEvent?: (event: ControllerEvent) => void;
+  /** The ASR transcript is almost certainly the assistant's own speaker audio. */
+  onSelfEcho?: () => void;
   onError?: (error: Error) => void;
 }
 
@@ -45,12 +47,12 @@ export interface VoiceBrainOptions {
 }
 
 const DEFAULT_WAKE_PATTERNS: RegExp[] = [
-  /\b(hello|hi|hey|ok)[\s,，]*(cyrvis|cyrus|cyris|cyprus|cypres|cypress|cybris|sirvis|cervis|sirius|siris|service)\b/i,
-  /\b(cyrvis|cyrus|cyris|cyprus|cypres|cypress|cybris)\b/i,
-  /\b(hello|hi|hey)\b/i,
-  /(你好|您好|嗨)/,
-  /(你好|嗨|喂)[，,\s]*(cyrvis|赛维斯|瑟维斯|瑟尔维斯|赛勒斯|塞勒斯|赛鲁斯|塞浦路斯)/i,
-  /(赛维斯|瑟维斯|瑟尔维斯|赛勒斯|塞勒斯|赛鲁斯)/i,
+  /\b(hello|hallo|hi|hey|ok)[\s,，]*(cyrvis|cyrus|cyris|cyprus|cypres|cypress|cybris|sirvis|cervis|sirius|siris|service|zawis|zavis|savis|cywiz|cy vis)\b/i,
+  /\b(cyrvis|cyrus|cyris|cyprus|cypres|cypress|cybris|zawis|zavis|savis)\b/i,
+  /\b(hello|hallo|hi|hey)\b/i,
+  /(你好|您好|嗨|哈喽|哈啰|哈罗)/,
+  /(你好|您好|嗨|喂|哈喽|哈啰|哈罗)[，,\s]*(cyrvis|赛维斯|瑟维斯|瑟尔维斯|赛勒斯|塞勒斯|赛鲁斯|塞浦路斯|塞维斯)/i,
+  /(赛维斯|瑟维斯|瑟尔维斯|赛勒斯|塞勒斯|赛鲁斯|塞维斯)/i,
 ];
 
 const normalize = (text: string) =>
@@ -84,6 +86,15 @@ export class VoiceBrain {
   private completionGuardTriggered = false;
   private awakeTimer: ReturnType<typeof setTimeout> | null = null;
   private speakWatchdog: ReturnType<typeof setTimeout> | null = null;
+  private playbackWatchdog: ReturnType<typeof setTimeout> | null = null;
+  private responseHadAudio = false;
+  private lastAssistantText = '';
+  private lastAssistantAudioAt = 0;
+  private suppressControlProactivityUntil = 0;
+  private lastDeterministicControl: {
+    kind: 'cancel' | 'pause';
+    at: number;
+  } | null = null;
   private readonly unsubscribeController: () => void;
   private readonly completionClaimPattern =
     /(已经打开|已经输入|已经完成|已完成|完成了|打开了|输入了|opened|typed|completed|finished|done|succeeded)/i;
@@ -122,7 +133,17 @@ export class VoiceBrain {
 
     this.unsubscribeController = controller.onEvent((event) => {
       this.callbacks.onTaskEvent?.(event);
-      if (this.options.enableProactivity !== false) {
+      // Pause/cancel/resume are acknowledged by the tool-result response.
+      // The proactive "已暂停/已停止" line used to race that response and cut
+      // it off mid-word. Suppress control events for a short window after the
+      // user's control utterance; task_done/task_failed still speak.
+      const isControlEvent =
+        event.type === 'task_paused' ||
+        event.type === 'task_cancelled' ||
+        event.type === 'task_resumed';
+      const controlSuppressed =
+        isControlEvent && Date.now() < this.suppressControlProactivityUntil;
+      if (this.options.enableProactivity !== false && !controlSuppressed) {
         this.proactivity.onEvent(event);
       }
       this.notifyState();
@@ -163,6 +184,7 @@ export class VoiceBrain {
 
   dispose(): void {
     this.clearAwakeTimer();
+    this.clearPlaybackWatchdog();
     if (this.speakWatchdog) {
       clearTimeout(this.speakWatchdog);
       this.speakWatchdog = null;
@@ -187,6 +209,7 @@ export class VoiceBrain {
       onSpeechStarted: () => {
         this.userSpeaking = true;
         this.ttsSpeaking = false;
+        this.clearPlaybackWatchdog();
         this.proactivity.setUserSpeaking(true);
         this.proactivity.setTtsSpeaking(false);
         this.callbacks.onSpeechStarted?.();
@@ -200,6 +223,9 @@ export class VoiceBrain {
       },
       onTranscript: (text, final) => this.handleTranscript(text, final),
       onAssistantText: (text, final) => {
+        if (final && text.trim()) {
+          this.lastAssistantText = text;
+        }
         this.guardCompletionClaim(text);
         this.callbacks.onAssistantText?.(text, final);
       },
@@ -211,6 +237,8 @@ export class VoiceBrain {
         });
       },
       onAudio: (pcm16) => {
+        this.responseHadAudio = true;
+        this.lastAssistantAudioAt = Date.now();
         if (this.awake && !this.suppressAudioUntilResponseDone) {
           this.callbacks.onAudio?.(pcm16);
         }
@@ -219,6 +247,8 @@ export class VoiceBrain {
         this.assistantTextBuffer = '';
         this.completionGuardTriggered = false;
         this.suppressAudioUntilResponseDone = false;
+        this.responseHadAudio = false;
+        this.clearPlaybackWatchdog();
         this.ttsSpeaking = true;
         this.proactivity.setTtsSpeaking(true);
         this.notifyState();
@@ -227,9 +257,23 @@ export class VoiceBrain {
         this.assistantTextBuffer = '';
         this.suppressAudioUntilResponseDone = false;
         this.completionGuardTriggered = false;
+        this.resetAwakeTimer();
+        if (this.responseHadAudio) {
+          // The server finished generating audio, but the renderer is still
+          // playing the WAV queue. Keep ttsSpeaking=true so proactive lines
+          // cannot start a second response and cut this one off.
+          this.armPlaybackWatchdog();
+        } else {
+          this.ttsSpeaking = false;
+          this.proactivity.setTtsSpeaking(false);
+          this.clearPlaybackWatchdog();
+        }
+        this.notifyState();
+      },
+      onPlaybackIdle: () => {
+        this.clearPlaybackWatchdog();
         this.ttsSpeaking = false;
         this.proactivity.setTtsSpeaking(false);
-        this.resetAwakeTimer();
         this.notifyState();
       },
       onError: (error) => {
@@ -266,12 +310,27 @@ export class VoiceBrain {
     this.lastFinalTranscript = text;
     this.lastFinalAt = now;
 
+    // Speaker mode: the mic can pick up the assistant's own voice. If ASR
+    // returns a short echo of the last reply ("我在", "我来", "我"), do not
+    // start another turn; otherwise the model answers itself forever.
+    if (this.isSelfEchoTranscript(text)) {
+      console.log('[cyrvis voice] self-echo transcript ignored', text);
+      this.callbacks.onSelfEcho?.();
+      this.provider.cancelResponse();
+      return;
+    }
+
     this.lastUserText = text;
 
     // Safety-critical: stop/pause must act even if the voice model forgets to
     // call the tool (observed in real testing: it said "paused" but the GUI
     // agent kept running).
-    this.handleDeterministicControl(text);
+    const deterministicControl = this.handleDeterministicControl(text);
+    if (deterministicControl) {
+      // The tool-result response is the single acknowledgment. Suppress the
+      // proactive "已暂停/已停止" line that would otherwise race it.
+      this.suppressControlProactivityUntil = Date.now() + 5000;
+    }
 
     if (!this.awake) {
       const decision = classifyIntent(text);
@@ -283,6 +342,7 @@ export class VoiceBrain {
         this.wake();
       } else {
         // The model may already be answering background speech. Suppress it.
+        console.log('[cyrvis voice] asleep; transcript ignored', text);
         this.provider.cancelResponse();
       }
       this.notifyState();
@@ -363,6 +423,21 @@ export class VoiceBrain {
         break;
       }
       case 'cancel_gui_task': {
+        this.suppressControlProactivityUntil = Date.now() + 5000;
+        if (
+          this.lastDeterministicControl?.kind === 'cancel' &&
+          Date.now() - this.lastDeterministicControl.at < 4000
+        ) {
+          this.provider.sendToolResult(
+            call.callId,
+            JSON.stringify({
+              ok: true,
+              status: this.controller.getStatus().status,
+              message: 'ALREADY_HANDLED',
+            }),
+          );
+          break;
+        }
         const task = await this.controller.cancelTask(call.args.task_id);
         this.provider.sendToolResult(
           call.callId,
@@ -371,6 +446,21 @@ export class VoiceBrain {
         break;
       }
       case 'pause_gui_task': {
+        this.suppressControlProactivityUntil = Date.now() + 5000;
+        if (
+          this.lastDeterministicControl?.kind === 'pause' &&
+          Date.now() - this.lastDeterministicControl.at < 4000
+        ) {
+          this.provider.sendToolResult(
+            call.callId,
+            JSON.stringify({
+              ok: true,
+              status: this.controller.getStatus().status,
+              message: 'ALREADY_HANDLED',
+            }),
+          );
+          break;
+        }
         const task = await this.controller.pauseTask();
         this.provider.sendToolResult(
           call.callId,
@@ -410,13 +500,13 @@ export class VoiceBrain {
     }
   }
 
-  private handleDeterministicControl(text: string): void {
+  private handleDeterministicControl(text: string): 'cancel' | 'pause' | null {
     const status = this.controller.getStatus().status;
     const active = ['starting', 'executing', 'paused', 'cancelling'].includes(
       status,
     );
     if (!active) {
-      return;
+      return null;
     }
 
     const explicitCancel =
@@ -425,18 +515,29 @@ export class VoiceBrain {
     const pause = /(暂停|等一下|等等|pause)/i.test(text);
 
     if (explicitCancel) {
+      this.lastDeterministicControl = { kind: 'cancel', at: Date.now() };
+      // Set this before calling the controller: cancelTask can emit
+      // task_cancelled synchronously, and that event must not trigger the
+      // proactive "已停止" line.
+      this.suppressControlProactivityUntil = Date.now() + 5000;
       void this.controller.cancelTask().catch((error: unknown) => {
         this.callbacks.onError?.(
           error instanceof Error ? error : new Error(String(error)),
         );
       });
-    } else if (pause) {
+      return 'cancel';
+    }
+    if (pause) {
+      this.lastDeterministicControl = { kind: 'pause', at: Date.now() };
+      this.suppressControlProactivityUntil = Date.now() + 5000;
       void this.controller.pauseTask().catch((error: unknown) => {
         this.callbacks.onError?.(
           error instanceof Error ? error : new Error(String(error)),
         );
       });
+      return 'pause';
     }
+    return null;
   }
 
   private guardCompletionClaim(text: string): void {
@@ -472,6 +573,30 @@ export class VoiceBrain {
     }, 300);
   }
 
+  private isSelfEchoTranscript(text: string): boolean {
+    if (!this.lastAssistantText.trim()) {
+      return false;
+    }
+    // Only close to recent assistant audio; this avoids treating an unrelated
+    // "我在" much later as an echo.
+    if (Date.now() - this.lastAssistantAudioAt > 3000) {
+      return false;
+    }
+    const strip = (value: string) =>
+      normalize(value).replace(/[，。！？,.!?\s]/g, '');
+    const heard = strip(text);
+    if (!heard) {
+      return false;
+    }
+    const spoken = strip(this.lastAssistantText);
+    if (spoken.includes(heard) || heard.includes(spoken)) {
+      return true;
+    }
+    // ASR often truncates the assistant's short acknowledgement in speaker
+    // mode. Keep this list deliberately narrow so a real "停" is unaffected.
+    return /^(我在|我来|我|在听|我听到了|听到|嗯+|啊+|好+)$/.test(heard);
+  }
+
   private isWakePhrase(text: string): boolean {
     const normalized = normalize(text);
     return this.wakePatterns.some((pattern) => pattern.test(normalized));
@@ -502,6 +627,24 @@ export class VoiceBrain {
       this.proactivity.setTtsSpeaking(false);
       this.notifyState();
     }, 15_000);
+  }
+
+  private armPlaybackWatchdog(): void {
+    this.clearPlaybackWatchdog();
+    this.playbackWatchdog = setTimeout(() => {
+      this.playbackWatchdog = null;
+      console.warn('[cyrvis voice] playback idle watchdog fired');
+      this.ttsSpeaking = false;
+      this.proactivity.setTtsSpeaking(false);
+      this.notifyState();
+    }, 15_000);
+  }
+
+  private clearPlaybackWatchdog(): void {
+    if (this.playbackWatchdog) {
+      clearTimeout(this.playbackWatchdog);
+      this.playbackWatchdog = null;
+    }
   }
 
   private resetAwakeTimer(): void {

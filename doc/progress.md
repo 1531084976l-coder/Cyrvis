@@ -1,5 +1,41 @@
 # CYRVIS 进度
 
+## 2026-11-16
+- [x] GUI Agent Action Batching：`GUIAgent` 已支持同轮执行多个 `parsedPredictions`；给 `DOUBAO_1_5_15B` 提示词加入受限多动作规则（2–4 个、空行分隔、仅限可预测序列）。
+- [x] 增加 `[GUIAgent] action batch {count, types}` 日志与批内 200ms 动作间隔。
+- [x] 无执行探针验证：安全序列“输入后回车”返回 2 条动作；打开命令面板的序列仍只返回 1 条。
+- [x] 端到端验证：日志确认单轮执行 `type` + `hotkey(enter)`，总循环 3 次（逐条约 4 次）；但目标窗口焦点错误，文本未落盘，模型误报完成。
+- [x] 收紧提示词：click+type 仅在截图中已见文本光标时允许；`finished` 前必须核对最新截图。
+- [x] parser 26/26 测试通过；新增 SDK 单测“一次响应 2 个动作只截 1 次图”，GUIAgent 5/5 通过；App main typecheck 通过；SDK 已重新构建。
+- [x] 干净复测通过：记事本已聚焦、光标在末尾、不点击；模型一轮返回 `type` + `hotkey(enter)`，总 `loopCnt=2`，截图确认 `PRE batch test`、光标到第 2 行第 1 列。任务未要求保存，文件标题仍带 `*`。
+- [x] 制定 GUI 加速实验方案 `doc/gui-acceleration-plan.md`：第一批只跑 4 个任务——L1 记事本（批量友好）、L4 本地搜索→新标签→详情（状态依赖）、L5 跨应用读码→保存（跨窗口）、R1 携程上海→巴黎机票（真实长任务）。L2/L3/L6/L7/R2/R3 进候选池。按分组汇报，避免只用 batch-friendly 任务。MCP/直连本轮不做。
+- [ ] 可选下一步：把 `loopIntervalInMs` 1000→300 做对比；或增加“输入后保存文件”的任务验证带对话框的批量边界。
+- [x] 开始 ShowUI-2B 接入：模型下载到 `D:\Desktop\project\CYRVIS\models\ShowUI-2B`，Python 环境 `D:\Desktop\project\CYRVIS\showui-env`；侧车 `scripts/cyrvis/showui-server/app.py`、`run-showui.ps1`、映射 README 已写。
+- [x] Benchmark harness 初版：`scripts/cyrvis/bench/`（本地站点 server、L1/L4/L5/R1 setup、CDP run-task、README）。
+- [x] 基线 B0（Seed 2.1 Lite，每任务 1 次）：L1 成功 6 轮/48.6s/0 批量；L4 成功 11 轮/104.5s/1 次批量（type+Enter）；L5 成功 4 轮/29.4s/0 批量；R1 携程超时失败 27 轮/300s/20.5 万 tokens（卡在目的地下拉/日期选择）。结果记录在 `doc/benchmark-results.md`。
+- [x] CUDA PyTorch 2.11.0+cu128 在 RTX 5060 上验证可用（`torch.cuda.is_available()=True`）；ShowUI-2B 下载完成（约 4.2GB）。
+- [x] ShowUI-2B 侧车跑通：BF16 占用 4.12GB，2.3–3.4s/步，1MP 输入；L4 网页任务成功 5 轮/35.4s（Seed 11 轮/104.5s）；L1/L5 桌面任务失败，原因是动作空间没有 `hotkey`/`Ctrl+S`/跨应用能力，模型卡在 `SCROLL`。
+- [x] 修复侧车坐标异常：`1<v<=100` 按百分比归一化（45→0.45），>100 按像素；修复后 L4 通过。侧车 keep-alive 改为 120s，待复测连接错误。
+- [ ] 恢复 App 的 Ark 配置并重启；ShowUI 侧车保留为可选的网页任务后端。下一步评估“按任务类型路由”（浏览器→ShowUI，桌面→Seed）或给侧车加快捷键桥接。
+- [x] 修复“暂停/取消”双回复与截断：控制事件不再触发主动播报；工具结果/主动播报在 `playbackBusy` 时排队，等渲染端真正播完再发；`ttsSpeaking` 保持到 `playback-idle`；渲染端不再在新响应开始时无条件 `stopPlayback()`；确定性控制与工具调用去重。57/57 测试通过。
+- [x] 修复外放/耳机路由：去掉硬编码 `扬声器 (Realtek`；耳机模式显式选耳机设备，不再只用 `default`；外放模式动态找扬声器（优先模拟/HDMI，排除 Digital Output/ToDesk/耳机）；语音条新增输出设备下拉框；模式和设备持久化。当前机器只枚举到 Realtek 扬声器/NVIDIA/ToDesk，没有耳机输出（需把耳机作为输出设备连接）；默认已从错误的 Realtek Digital Output 改为 `扬声器 (Realtek High Definition Audio)`。
+- [x] 解耦“输出设备”和“语音模式”：选择扬声器不再自动切语音模式；输出由下拉框独立控制。
+- [x] 外放模式改为**语音打断**：播放期间保留麦克风能量检测，阈值 2000 / 180ms（`CYRVIS_SPEAKER_BARGE_THRESHOLD` 可覆盖），600ms 预录回灌，播放后仅 100ms 尾音保护；`Ctrl+Alt+X` 继续兜底。外放不再半双工丢麦。57/57 测试通过，node/web typecheck 通过。
+- [ ] 真机复测外放打断：需要入耳麦连接；观察 `[cyrvis capture] level { playing: true, avg/peak }` 与 `barge-in { mode: 'speaker', threshold: 2000 }`；若外放串音误触发，调高阈值。
+- [x] 两种模式自动化：**耳机模式** = 蓝牙耳机麦 + 蓝牙耳机输出；**外放模式** = 蓝牙耳机麦 + 主机 Realtek 扬声器。模式按钮现在自动切 Windows 默认端点（`scripts/cyrvis/audio/set-default-output.ps1`，PolicyConfig）、切 App `<audio>.setSinkId`、重启采集但保持耳机麦。实测双向：耳机→默认/输出 Bluetooth，外放→默认/输出 Realtek。
+- [x] 修复“说不出话”根因：13:52 语音处于 sleep，ASR 把“哈喽，塞维斯”转成文本但旧唤醒词不匹配（缺“哈喽/塞维斯/Zawis”），回复文本生成了但 `awake=false` 导致音频被丢弃。已补唤醒词变体、睡眠时输出 `asleep; transcript ignored` 日志；当前 `awake=true`。
+- [x] 修复外放“我一直我在”自听循环：日志显示外放时麦克风串音 3933–13183，远高于阈值 2000；barge-in 把助手自己的“我在”送进 ASR，模型自问自答。已加自听转写过滤（“我在/我来/我”等直接丢弃）、每次回复 600ms 串音探测（>1500 自动禁用本次语音打断，`Ctrl+Alt+X` 仍可用），并补单测；58/58 通过。
+- [x] **Qwen 语音切到 Token Plan**：新 `sk-sp-…` Key 在公共 DashScope 返回 401；Token Plan host 为 `token-plan.maas.qianwenaiapi.com`，模型列表含 `qwen-audio-3.0-realtime-plus`（无 flash）。Realtime WS `wss://token-plan.maas.qianwenaiapi.com/api-ws/v1/realtime?model=qwen-audio-3.0-realtime-plus` 用 App 兼容 `session.update` 实测 `session.updated` 成功；`.env` 已设 `QWEN_MODEL/QWEN_VOICE/QWEN_REALTIME_URL`，App 重启后日志 `qwen session ready`、`qwen connected`、`wake`。
+- [x] 蓝牙耳机 `cc ultimate` 已重新连接，采集 `ready`；App 当前外放模式（耳机麦 + Realtek 扬声器）。
+- [x] 修复外放“只回 Hello 就断”：旧串音探测从 `response.created` 起算 600ms，但首段音频约 800ms 后才到，测到的是静音；播放后串音 11158 误触发 barge，取消回复。现改为**首段音频开始测 1200ms**，同时看平均/峰值；检测到串音或自听则 60 秒内关闭外放语音打断。实测：`high speaker leakage { avg: 1060, max: 4488 }` 后无 `barge-in`，回复完整播完；日志 0 次误 barge。
+- [x] 修复 Token Plan plus 的 **30 秒输入缓冲上限**：空闲噪声持续 append 但不 commit，服务端报 `Input audio buffer exceeded maximum duration (30s)` 并刷屏。已加每 15 秒空闲 `input_audio_buffer.clear`，服务端 `error` 时关闭旧连接并重连。实测 3 次 trim、0 次 30 秒错误。
+- [ ] 测试音频 `hello-cyrvis.wav` 实际内容是 “Hello service, open Notepad and type hello”，复测时误触发了一个记事本任务（已结束）；后续自动化测试改用纯唤醒词 WAV。
+- [x] 修复冷却期“完全打断不了”：原来 `speakerBargeSuppressed` 直接 return 60 秒；改为自适应门槛（500ms 能量窗口中位数×3，冷却期最低 2500）。外放朗读时句子间说“停”仍可打断，`Ctrl+Alt+X`/界面 Interrupt 继续兜底。
+- [ ] **蓝牙耳机再次断开**：20:45:24 采集 ready，约 20:45:30 后 `cc ultimate` 从 Windows 消失，采集重试 3 次后停止；需重新连接耳机后复测“朗读中说话打断”。
+- [x] 21:00 复测发现模式按钮歧义：旧按钮显示当前模式，点一下切到另一个；用户实际在耳机模式（日志 `mode: 'headset'`），21:01:01 的 `barge-in avg=3875` 证明耳机模式语音打断有效。已改为“耳机 / 外放”两个并列按钮；已通过 IPC 切到外放并确认采集 ready。
+- [x] 明确外放物理上限：串音 3933–13183 > 用户人声 3000–4500，助手大声说话时纯阈值无法可靠区分；自适应门槛只能利用句子停顿打断。要“随时打断”需 AEC 或指向性/带杆麦克风。
+- [ ] 重启 App 后让用户复测：暂停/取消语音是否只播一遍且完整；选择外放/耳机设备后是否路由正确；外放模式下“语音打断”是否仍按半双工策略工作。
+
 ## 2026-11-15
 - [x] 仓库整理：CYRVIS 文档迁入 `doc/`，新增 `README.cyrvis.md`、`doc/README.md`、`doc/roadmap.md`、`doc/development.md`；原始产品愿景归档到 `doc/archive/product-vision-v1.md`。
 - [x] 首次提交 `641da6d8` 已推送到 GitHub `main`（SSH）；GitHub 仓库改名 `CYRVIS` 待网页操作/重定向。

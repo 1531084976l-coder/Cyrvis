@@ -36,6 +36,11 @@ import {
 } from './constants';
 import { InternalServerError } from 'openai';
 
+// A batch executes without a fresh screenshot between actions. Give the target
+// UI a moment to settle (focus after click, text before Enter) so the next
+// action does not race the previous one.
+const BATCH_ACTION_DELAY_MS = 200;
+
 export class GUIAgent<T extends Operator> extends BaseGUIAgent<
   GUIAgentConfig<T>
 > {
@@ -315,6 +320,10 @@ export class GUIAgent<T extends Operator> extends BaseGUIAgent<
           '[GUIAgent] Parsed Predictions:',
           JSON.stringify(parsedPredictions),
         );
+        logger.info('[GUIAgent] action batch', {
+          count: parsedPredictions.length,
+          types: parsedPredictions.map((item) => item.action_type),
+        });
 
         if (!prediction) {
           logger.error('[GUIAgent] Response Empty:', prediction);
@@ -349,7 +358,12 @@ export class GUIAgent<T extends Operator> extends BaseGUIAgent<
         });
 
         // start execute action
+        let actionIndex = 0;
         for (const parsedPrediction of parsedPredictions) {
+          if (actionIndex > 0 && parsedPredictions.length > 1) {
+            await sleep(BATCH_ACTION_DELAY_MS);
+          }
+          actionIndex += 1;
           const actionType = parsedPrediction.action_type;
 
           logger.info('[GUIAgent] Action:', actionType);

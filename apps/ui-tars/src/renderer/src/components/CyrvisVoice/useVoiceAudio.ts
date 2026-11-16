@@ -23,6 +23,11 @@ export interface VoiceUiState {
   task: VoiceTaskSnapshot;
 }
 
+export interface OutputDeviceOption {
+  deviceId: string;
+  label: string;
+}
+
 const EMPTY_STATE: VoiceUiState = {
   awake: false,
   userSpeaking: false,
@@ -87,6 +92,8 @@ export function useVoiceAudio() {
   const [audioMode, setAudioModeState] = useState<'headset' | 'speaker'>(
     'headset',
   );
+  const [outputDevices, setOutputDevices] = useState<OutputDeviceOption[]>([]);
+  const [selectedOutputId, setSelectedOutputId] = useState('');
   const [error, setError] = useState<string | null>(null);
   const [ptt, setPtt] = useState<{ active: boolean; mode: boolean }>({
     active: false,
@@ -101,6 +108,7 @@ export function useVoiceAudio() {
   const pendingSamplesRef = useRef<number[]>([]);
   const playerRef = useRef<WavStreamPlayer | null>(null);
   const outputDeviceIdRef = useRef<string | null>(null);
+  const audioModeRef = useRef<'headset' | 'speaker'>('headset');
   const playbackChunksRef = useRef(0);
   const assistantSpeakingRef = useRef(false);
   const assistantIdleTimerRef = useRef<ReturnType<typeof setTimeout> | null>(
@@ -282,11 +290,25 @@ export function useVoiceAudio() {
 
   const applyOutput = useCallback(async (needle: string) => {
     const devices = await navigator.mediaDevices.enumerateDevices();
-    const output = devices.find(
+    const matches = devices.filter(
       (device) =>
         device.kind === 'audiooutput' &&
-        device.label.toLowerCase().includes(needle.toLowerCase()),
+        (device.label.toLowerCase().includes(needle.toLowerCase()) ||
+          device.deviceId === needle),
     );
+    // The 'Default - ...' alias often shares a label with the physical device.
+    // Prefer the physical endpoint so the dropdown and setSinkId agree.
+    let output: MediaDeviceInfo | undefined =
+      matches.find(
+        (device) =>
+          device.deviceId !== 'default' && device.deviceId !== 'communications',
+      ) ?? matches[0];
+    if (!output && /^系统默认/.test(needle)) {
+      output = devices.find(
+        (device) =>
+          device.kind === 'audiooutput' && device.deviceId === 'default',
+      );
+    }
     if (!output) {
       console.warn('[cyrvis] output not found', needle);
       return null;
@@ -305,33 +327,245 @@ export function useVoiceAudio() {
     return `${output.label} (${output.deviceId.slice(0, 8)})`;
   }, []);
 
-  const resetOutput = useCallback(async () => {
-    outputDeviceIdRef.current = null;
-    const player = playerRef.current;
-    if (player) {
-      try {
-        await player.setSinkId('default');
-      } catch (error) {
-        console.warn('[cyrvis] reset output failed', error);
-      }
+  const refreshOutputDevices = useCallback(async () => {
+    const devices = await navigator.mediaDevices.enumerateDevices();
+    const all = devices.filter(
+      (device) => device.kind === 'audiooutput' && device.deviceId,
+    );
+    const physical = all
+      .filter(
+        (device) =>
+          device.deviceId !== 'default' &&
+          device.deviceId !== 'communications' &&
+          !/^Communications - /i.test(device.label),
+      )
+      .map((device) => ({ deviceId: device.deviceId, label: device.label }));
+    const defaultAlias = all.find((device) => device.deviceId === 'default');
+    let outputs = physical;
+    if (defaultAlias) {
+      outputs = [
+        ...physical,
+        {
+          deviceId: 'default',
+          label: defaultAlias.label.replace(/^Default - /i, '系统默认 - '),
+        },
+      ];
     }
+    if (!outputs.length) {
+      // Before mic permission, only the default alias may be available.
+      outputs = all.map((device) => ({
+        deviceId: device.deviceId,
+        label: device.label,
+      }));
+    }
+    setOutputDevices(outputs);
+    return outputs;
   }, []);
 
-  const applyAudioMode = useCallback(
-    (mode: 'headset' | 'speaker') => {
-      if (mode === 'speaker') {
-        void applyOutput('扬声器 (Realtek');
-      } else {
-        void resetOutput();
+  const rememberOutput = useCallback((output: OutputDeviceOption) => {
+    outputDeviceIdRef.current = output.deviceId;
+    setSelectedOutputId(output.deviceId);
+    localStorage.setItem('cyrvis.outputDeviceId', output.deviceId);
+  }, []);
+
+  const setOutputDevice = useCallback(
+    async (deviceId: string) => {
+      const outputs = await refreshOutputDevices();
+      const output = outputs.find((item) => item.deviceId === deviceId);
+      if (!output) {
+        console.warn('[cyrvis] selected output disappeared', deviceId);
+        return;
+      }
+      rememberOutput(output);
+      const player = playerRef.current;
+      if (player) {
+        try {
+          await player.setSinkId(output.deviceId);
+        } catch (error) {
+          console.warn('[cyrvis] set selected output failed', error);
+        }
+      }
+      // setOutput also tells the main process whether this is speaker or
+      // headset mode (based on the device label), so capture/AEC follows.
+      await window.electron.voice.setOutput(output.label);
+      console.log(
+        '[cyrvis] selected output',
+        output.label,
+        output.deviceId.slice(0, 8),
+        player ? 'player' : 'stored',
+      );
+    },
+    [refreshOutputDevices, rememberOutput],
+  );
+
+  const testOutputDevice = useCallback(
+    async (deviceId: string) => {
+      const outputs = await refreshOutputDevices();
+      const output =
+        outputs.find((item) => item.deviceId === deviceId) ??
+        outputs.find((item) => item.deviceId === outputDeviceIdRef.current);
+      if (!output) {
+        console.warn('[cyrvis] test tone: no output selected');
+        return;
+      }
+      const sampleRate = 24000;
+      const seconds = 1;
+      const frames = sampleRate * seconds;
+      const buffer = new ArrayBuffer(44 + frames * 2);
+      const view = new DataView(buffer);
+      const write = (offset: number, text: string) => {
+        for (let i = 0; i < text.length; i += 1) {
+          view.setUint8(offset + i, text.charCodeAt(i));
+        }
+      };
+      write(0, 'RIFF');
+      view.setUint32(4, 36 + frames * 2, true);
+      write(8, 'WAVE');
+      write(12, 'fmt ');
+      view.setUint32(16, 16, true);
+      view.setUint16(20, 1, true);
+      view.setUint16(22, 1, true);
+      view.setUint32(24, sampleRate, true);
+      view.setUint32(28, sampleRate * 2, true);
+      view.setUint16(32, 2, true);
+      view.setUint16(34, 16, true);
+      write(36, 'data');
+      view.setUint32(40, frames * 2, true);
+      for (let i = 0; i < frames; i += 1) {
+        const sample = Math.sin((2 * Math.PI * 440 * i) / sampleRate) * 0.2;
+        view.setInt16(44 + i * 2, sample * 0x7fff, true);
+      }
+      const url = URL.createObjectURL(
+        new Blob([buffer], { type: 'audio/wav' }),
+      );
+      const audio = new Audio(url);
+      const sinkable = audio as HTMLAudioElement & {
+        setSinkId?: (id: string) => Promise<void>;
+      };
+      try {
+        if (sinkable.setSinkId) {
+          await sinkable.setSinkId(output.deviceId);
+        }
+        await audio.play();
+        console.log(
+          '[cyrvis] test tone',
+          output.label,
+          output.deviceId.slice(0, 8),
+          (audio as HTMLAudioElement & { sinkId?: string }).sinkId?.slice(
+            0,
+            8,
+          ) ?? 'unknown',
+        );
+      } catch (error) {
+        console.warn('[cyrvis] test tone failed', error);
+      } finally {
+        setTimeout(() => {
+          audio.pause();
+          URL.revokeObjectURL(url);
+        }, 1200);
       }
     },
-    [applyOutput, resetOutput],
+    [refreshOutputDevices],
+  );
+
+  const applyAudioMode = useCallback(
+    async (mode: 'headset' | 'speaker') => {
+      const outputs = await refreshOutputDevices();
+      const speakerPattern =
+        /扬声器|speaker|realtek|nvidia|display|显示器|hdmi/i;
+      const headsetPattern = /耳机|headphone|headset|airpods|bluetooth|蓝牙/i;
+
+      let output: OutputDeviceOption | undefined;
+      const badSpeakerPattern =
+        /digital output|todesk|virtual|communications|通信|耳机|headphone|headset|airpods/i;
+      if (mode === 'speaker') {
+        // Prefer a real analog/HDMI speaker over S/PDIF "Digital Output",
+        // ToDesk virtual audio, or a headset.
+        output =
+          outputs.find(
+            (device) =>
+              /扬声器|speaker/i.test(device.label) &&
+              !badSpeakerPattern.test(device.label),
+          ) ??
+          outputs.find(
+            (device) =>
+              speakerPattern.test(device.label) &&
+              !badSpeakerPattern.test(device.label),
+          ) ??
+          outputs.find(
+            (device) =>
+              device.deviceId === 'default' &&
+              !badSpeakerPattern.test(device.label),
+          );
+        if (!output) {
+          console.warn(
+            '[cyrvis] no speaker output found; keeping current output',
+            outputs.map((device) => device.label),
+          );
+          return;
+        }
+      } else {
+        // Headset mode must explicitly select a headphone device. Sending only
+        // 'default' is the old bug: if Windows default is the external speaker,
+        // headset mode still played on the speaker.
+        output =
+          outputs.find(
+            (device) =>
+              headsetPattern.test(device.label) &&
+              !/digital output|todesk|virtual/i.test(device.label),
+          ) ??
+          outputs.find((device) => device.deviceId === 'default') ??
+          outputs[0];
+        if (!output) {
+          console.warn('[cyrvis] no headphone output found');
+          return;
+        }
+      }
+
+      rememberOutput(output);
+      const player = playerRef.current;
+      if (player) {
+        try {
+          await player.setSinkId(output.deviceId);
+        } catch (error) {
+          console.warn('[cyrvis] apply audio mode output failed', error);
+        }
+      }
+      console.log(
+        '[cyrvis] audio mode output',
+        mode,
+        output.label,
+        output.deviceId.slice(0, 8),
+        player ? 'player' : 'stored',
+      );
+    },
+    [refreshOutputDevices, rememberOutput],
+  );
+
+  const selectAudioMode = useCallback(
+    async (next: 'headset' | 'speaker') => {
+      if (audioModeRef.current === next) {
+        return;
+      }
+      setAudioModeState(next);
+      audioModeRef.current = next;
+      localStorage.setItem('cyrvis.audioMode', next);
+      await window.electron.voice.setAudioMode(next);
+      // Mode is a preset: switch both the Windows default endpoint (main) and
+      // the app playback sink (renderer) to the matching device.
+      await applyAudioMode(next);
+    },
+    [applyAudioMode],
   );
 
   const toggleAudioMode = useCallback(async () => {
-    const next = audioMode === 'speaker' ? 'headset' : 'speaker';
-    setAudioModeState(next);
-    await window.electron.voice.setAudioMode(next);
+    await selectAudioMode(
+      audioModeRef.current === 'speaker' ? 'headset' : 'speaker',
+    );
+  }, [selectAudioMode]);
+
+  useEffect(() => {
+    audioModeRef.current = audioMode;
   }, [audioMode]);
 
   const ensureMic = useCallback(async () => {
@@ -639,9 +873,31 @@ export function useVoiceAudio() {
     const owner = ownerRef.current;
 
     void window.electron.voice.getPtt().then((state) => setPtt(state));
-    void window.electron.voice.getAudioMode().then(({ mode }) => {
-      setAudioModeState(mode);
-      applyAudioMode(mode);
+    void window.electron.voice.getAudioMode().then(async ({ mode }) => {
+      const outputs = await refreshOutputDevices();
+      const savedOutputId = localStorage.getItem('cyrvis.outputDeviceId');
+      const savedOutput = outputs.find(
+        (device) => device.deviceId === savedOutputId,
+      );
+      // Restore the duplex/barge-in mode independently of the output device.
+      const savedMode = localStorage.getItem('cyrvis.audioMode');
+      const nextMode =
+        savedMode === 'speaker' || savedMode === 'headset'
+          ? (savedMode as 'headset' | 'speaker')
+          : mode;
+      setAudioModeState(nextMode);
+      audioModeRef.current = nextMode;
+      // Always re-apply: the main process also switches the Windows default
+      // endpoint, which is what makes speaker mode use the host speakers even
+      // when Electron's per-app audio route is stuck on Bluetooth.
+      void window.electron.voice.setAudioMode(nextMode);
+      if (savedOutput) {
+        // An explicit device choice wins over the mode preset.
+        rememberOutput(savedOutput);
+        void window.electron.voice.setOutput(savedOutput.label);
+        return;
+      }
+      void applyAudioMode(nextMode);
     });
 
     const cleanups = [
@@ -654,6 +910,10 @@ export function useVoiceAudio() {
       window.electron.voice.onThinking(() => setThinking(true)),
       window.electron.voice.onResponseStarted(() => {
         setThinking(false);
+        // If the previous response is still audible, do NOT stop its player:
+        // the provider serializes responses, but this is the last-resort guard
+        // against cutting a sentence in half when a tool result arrives.
+        const wasSpeaking = assistantSpeakingRef.current;
         bargeInMsRef.current = 0;
         preSpeechBufferRef.current = [];
         playbackChunksRef.current = 0;
@@ -670,7 +930,9 @@ export function useVoiceAudio() {
           assistantSpeakingRef.current = false;
           window.electron.voice.notifyPlaybackIdle();
         }, 10_000);
-        stopPlayback();
+        if (!wasSpeaking) {
+          stopPlayback();
+        }
       }),
       window.electron.voice.onResponseStopped(() => {
         setThinking(false);
@@ -732,11 +994,23 @@ export function useVoiceAudio() {
         setMicReady(false);
       }),
       window.electron.voice.onSetOutput((label) => {
-        void applyOutput(label);
+        void (async () => {
+          await applyOutput(label);
+          const outputs = await refreshOutputDevices();
+          const match = outputs.find((device) =>
+            device.label.toLowerCase().includes(label.toLowerCase()),
+          );
+          if (match) {
+            setSelectedOutputId(match.deviceId);
+            localStorage.setItem('cyrvis.outputDeviceId', match.deviceId);
+          }
+        })();
       }),
       window.electron.voice.onAudioMode(({ mode }) => {
         setAudioModeState(mode);
-        applyAudioMode(mode);
+        audioModeRef.current = mode;
+        // The mode button is a preset for both endpoint and barge threshold.
+        void applyAudioMode(mode);
       }),
     ];
 
@@ -923,6 +1197,32 @@ export function useVoiceAudio() {
     };
   }, [restartMic, start, stopCapture]);
 
+  useEffect(() => {
+    if (!navigator.mediaDevices?.addEventListener) {
+      return;
+    }
+    const onOutputsChanged = () => {
+      void (async () => {
+        const outputs = await refreshOutputDevices();
+        const savedId = localStorage.getItem('cyrvis.outputDeviceId');
+        const saved = outputs.find((device) => device.deviceId === savedId);
+        if (saved) {
+          await setOutputDevice(saved.deviceId);
+        } else {
+          await applyAudioMode(audioModeRef.current);
+        }
+      })();
+    };
+    void refreshOutputDevices();
+    navigator.mediaDevices.addEventListener('devicechange', onOutputsChanged);
+    return () => {
+      navigator.mediaDevices.removeEventListener(
+        'devicechange',
+        onOutputsChanged,
+      );
+    };
+  }, [refreshOutputDevices, setOutputDevice, applyAudioMode]);
+
   return {
     state,
     transcript,
@@ -931,6 +1231,10 @@ export function useVoiceAudio() {
     thinking,
     playbackActive,
     audioMode,
+    outputDevices,
+    selectedOutputId,
+    setOutputDevice,
+    testOutputDevice,
     error,
     ptt,
     start,
@@ -938,6 +1242,7 @@ export function useVoiceAudio() {
     togglePtt: window.electron.voice.togglePtt,
     interrupt: () => window.electron.voice.bargeIn(),
     toggleAudioMode,
+    selectAudioMode,
     forceAwake: window.electron.voice.forceAwake,
     sleep: window.electron.voice.sleep,
     cancelTask: window.electron.voice.cancelTask,
