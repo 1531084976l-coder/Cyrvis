@@ -59,8 +59,8 @@ let pttActive = false;
 // Hands-free by default. PTT remains available as a fallback mode.
 const pttMode = false;
 
-const CAPTURE_BARGE_THRESHOLD = 1000;
-const CAPTURE_BARGE_SUSTAIN_MS = 150;
+const CAPTURE_BARGE_THRESHOLD = 1500;
+const CAPTURE_BARGE_SUSTAIN_MS = 180;
 const SPEAKER_REVERB_GUARD_MS = 1400;
 // A bare "停" is often only 200-300ms. The old 220ms decay + 140ms confirm
 // discarded the whole word, so every short stop failed the probe.
@@ -1025,7 +1025,10 @@ export const startVoiceService = (): VoiceService | null => {
         // 1.2s felt like the assistant was deaf: users repeat "Hello" before
         // the endpoint fires, which extends the utterance and delays it more.
         // 800ms keeps natural pauses while making the first reply snappier.
-        silenceDurationMs: 800,
+        // 800ms felt sluggish: the user stops talking, then waits almost a
+        // second before the request is committed. 500ms keeps a natural pause
+        // while starting the reply noticeably sooner.
+        silenceDurationMs: 500,
       });
       return provider;
     },
