@@ -144,6 +144,9 @@ interface SpeakerProbeState {
 const speakerEchoDetector = new SpeakerEchoDetector();
 let speakerProbe: SpeakerProbeState | null = null;
 let speakerCandidateMs = 0;
+// Headset mode has no meaningful speaker echo; use direct energy barge so a
+// short "停" is never lost to a 700ms probe confirmation window.
+let headsetBargeMs = 0;
 let speakerResumeSuppressUntil = 0;
 let lastSpeakerDiagnosticAt = 0;
 let speakerBargeStopPending = false;
@@ -160,6 +163,7 @@ const resetSpeakerDetection = (): void => {
   speakerEchoDetector.reset();
   speakerProbe = null;
   speakerCandidateMs = 0;
+  headsetBargeMs = 0;
   speakerResumeSuppressUntil = 0;
 };
 
@@ -332,7 +336,14 @@ const handleSpeakerPlaybackPcm = (
   }
 
   if (analysis.ambiguous) {
-    startSpeakerProbe(now);
+    // By default, do not pause playback to "probe" an ambiguous echo. On this
+    // hardware the probe itself sounded like a brief stop and then resumed.
+    // CYRVIS_SPEAKER_PROBE=1 restores the old pause-and-confirm behavior.
+    if (process.env.CYRVIS_SPEAKER_PROBE === '1') {
+      startSpeakerProbe(now);
+    } else {
+      speakerCandidateMs = 0;
+    }
     return;
   }
 
@@ -371,10 +382,35 @@ const handleCapturePcm = (pcm16: Int16Array): void => {
 
   pushCapturePreroll(pcm16);
 
+  if (assistantPlaybackActive && !speakerOutputMode) {
+    const chunkMs = (pcm16.length / 16000) * 1000;
+    if (average > CAPTURE_BARGE_THRESHOLD) {
+      headsetBargeMs += chunkMs;
+    } else {
+      headsetBargeMs = Math.max(0, headsetBargeMs - chunkMs);
+    }
+    if (headsetBargeMs >= CAPTURE_BARGE_SUSTAIN_MS) {
+      logger.info('[cyrvis capture] barge-in', {
+        avg: Math.round(average),
+        mode: 'headset',
+      });
+      headsetBargeMs = 0;
+      assistantPlaybackActive = false;
+      const buffered = capturePreroll.splice(0);
+      service.provider.bargeIn();
+      service.brain.forceAwake();
+      service.brain.markUserStop();
+      broadcast('cyrvis:voice:response-stopped');
+      for (const chunk of buffered) {
+        service.provider.sendAudio(chunk);
+      }
+    }
+    return;
+  }
+
   if (assistantPlaybackActive) {
-    // Reference-aware gating is always active, not only when the user has
-    // explicitly selected speaker output. The physical output device can be
-    // a laptop speaker even while the UI is still in headset mode.
+    // Speaker mode: reference-aware gating; ambiguous echo is ignored rather
+    // than pausing playback for a probe.
     handleSpeakerPlaybackPcm(pcm16, average, now);
     return;
   }
