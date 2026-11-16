@@ -149,12 +149,17 @@ let speakerCandidateMs = 0;
 let headsetBargeMs = 0;
 let speakerResumeSuppressUntil = 0;
 let lastSpeakerDiagnosticAt = 0;
+let voiceprintPending = false;
+let lastVoiceprintAt = 0;
+const VOICEPRINT_COOLDOWN_MS = 600;
 let speakerBargeStopPending = false;
 let speakerBargeStopTimer: ReturnType<typeof setTimeout> | null = null;
 
 const pushCapturePreroll = (pcm16: Int16Array): void => {
   capturePreroll.push(pcm16.slice());
-  if (capturePreroll.length > 30) {
+  // Keep ~1s so the voiceprint verifier has enough audio for a stable
+  // embedding (ERes2Net works best with >=0.6s).
+  if (capturePreroll.length > 50) {
     capturePreroll.shift();
   }
 };
@@ -287,6 +292,59 @@ const handleSpeakerProbePcm = (
   }
 };
 
+const voiceprintUrl = (): string | null => {
+  const value = process.env.CYRVIS_VOICEPRINT_URL?.trim();
+  return value ? value.replace(/\/$/, '') : null;
+};
+
+/**
+ * Ask the local speaker-verification sidecar whether the last ~1s of mic audio
+ * belongs to the enrolled user. Returns null when the service is unavailable
+ * or not enrolled, so callers can fall back to the old barge policy.
+ */
+const verifyVoiceprint = async (): Promise<boolean | null> => {
+  const base = voiceprintUrl();
+  if (!base) {
+    return null;
+  }
+  const chunks = capturePreroll.slice(-50);
+  const total = chunks.reduce((sum, chunk) => sum + chunk.length, 0);
+  if (total < 9600) {
+    return null;
+  }
+  const pcm = new Int16Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    pcm.set(chunk, offset);
+    offset += chunk.length;
+  }
+  try {
+    const response = await fetch(`${base}/verify`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/octet-stream' },
+      body: Buffer.from(pcm.buffer, pcm.byteOffset, pcm.byteLength),
+    });
+    if (!response.ok) {
+      logger.warn('[cyrvis voiceprint] verify failed', {
+        status: response.status,
+      });
+      return null;
+    }
+    const result = (await response.json()) as {
+      score?: number;
+      match?: boolean;
+      threshold?: number;
+    };
+    logger.info('[cyrvis voiceprint] verify', result);
+    return typeof result.match === 'boolean' ? result.match : null;
+  } catch (error) {
+    logger.warn('[cyrvis voiceprint] unavailable', error);
+    return null;
+  } finally {
+    voiceprintPending = false;
+  }
+};
+
 const handleSpeakerPlaybackPcm = (
   pcm16: Int16Array,
   average: number,
@@ -322,6 +380,40 @@ const handleSpeakerPlaybackPcm = (
 
   speakerCandidateMs += chunkMs;
   if (speakerCandidateMs < CAPTURE_BARGE_SUSTAIN_MS) {
+    return;
+  }
+
+  // Speaker-verification gate: only an enrolled user's voice may interrupt.
+  // This is what lets us ignore the assistant's own speaker output even when
+  // its energy is higher than the user's voice.
+  if (
+    voiceprintUrl() &&
+    !voiceprintPending &&
+    now - lastVoiceprintAt >= VOICEPRINT_COOLDOWN_MS
+  ) {
+    lastVoiceprintAt = now;
+    speakerCandidateMs = 0;
+    voiceprintPending = true;
+    const fallbackDirect =
+      !analysis.ambiguous && analysis.referenceActive;
+    void verifyVoiceprint().then((match) => {
+      if (!assistantPlaybackActive) {
+        return;
+      }
+      if (match === true) {
+        logger.info('[cyrvis voiceprint] enrolled user; interrupt');
+        finishSpeakerBargeIn(
+          capturePreroll.slice(-SPEAKER_DIRECT_PREROLL_CHUNKS),
+        );
+      } else if (match === false) {
+        logger.info('[cyrvis voiceprint] not the user; keep playing');
+      } else if (fallbackDirect) {
+        logger.info('[cyrvis voiceprint] fallback direct interrupt');
+        finishSpeakerBargeIn(
+          capturePreroll.slice(-SPEAKER_DIRECT_PREROLL_CHUNKS),
+        );
+      }
+    });
     return;
   }
 

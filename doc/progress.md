@@ -153,3 +153,5 @@
 - [x] 语音延迟优化：本地 VAD 端点静音 800ms→500ms（少等约 0.3s）；耳机模式打断阈值 1000/150ms→1500/180ms，减少呼吸/耳机噪声触发的中途截断。Qwen 模型 TTFB 仍约 0.7–1.3s，Token Plan plus 无 qwen3.8 替代。
 - [x] 播放链路改为 WebAudio 连续调度：不再每 0.75s 新建 `<audio>` WAV 段，改为同一 AudioContext 上按时间无缝排队 AudioBufferSourceNode，消除段间咔哒/间隙；首包缓冲 0.35s。支持 `AudioContext.setSinkId` 保持耳机/外放路由，并向主进程发送带真实播放时间的参考 PCM。
 - [x] VAD 端点 500→400ms；再低会切分正常语句停顿，建议 400 为下限。
+- [x] 声纹原型：本地 sherpa-onnx ERes2Net（38MB，D 盘），`voiceprint-server` 提供 `/enroll` `/verify`；用户录入 8s + 5s 自检 score 0.7446，TTS 原始音频对用户声纹仅 0.114/0.170，阈值 0.55 区分良好。
+- [x] App 外放打断接入声纹：播放中候选能量达到阈值时，先 POST 最近 ~1s PCM 到 `127.0.0.1:8100/verify`；匹配用户才 `finishSpeakerBargeIn`，不匹配则继续播放；服务不可用时回退旧逻辑。
