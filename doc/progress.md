@@ -144,3 +144,4 @@
 - [x] 外放“停一下又继续”的直接原因：探针在 ambiguous 时暂停播放 700ms，等不到持续人声就恢复，听起来就是停一下继续。默认关闭自动探针暂停（`CYRVIS_SPEAKER_PROBE=1` 可恢复），ambiguous 回声直接忽略；只有明确近端声音才打断。
 - [x] 耳机模式恢复简单能量 barge（1000/150ms）：耳麦几乎无外放回声，不再走参考/探针流程，短“停”可直接打断。
 - [x] 改为确定性 barge stop：确认打断后不再把预录/打断语音送 ASR，直接 `provider.bargeIn()` + `muteMicFor(900)` + `brain.handleBargeStop()`；后者暂停正在执行的 GUI 任务并抑制 2 秒回复。这样“停/停一下”不依赖 ASR 是否听清，也不会延迟几秒后生成新回复。
+- [x] GUI Agent 从 ShowUI 切回 Ark：恢复 `%APPDATA%\ui-tars-desktop\ui_tars.setting.json` 的 `vlmBaseUrl=https://ark.cn-beijing.volces.com/api/plan/v3`、`vlmModelName=doubao-seed-2.1-lite`，保留新 `widgetOverlayMode`；Ark `/chat/completions` 实测 HTTP 200；App 内 `setting.getSetting()` 已确认加载该配置。ShowUI 侧车已停止。
