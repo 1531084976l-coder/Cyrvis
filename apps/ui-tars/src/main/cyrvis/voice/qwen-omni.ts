@@ -785,7 +785,10 @@ export class QwenOmniProvider implements VoiceProvider {
       }
       this.localSpeechMs += chunkMs;
       this.localSilenceMs = 0;
-      if (this.localSpeechMs >= 8000) {
+      // Do not cut a long explanation at 8s. The server cap is 30s; force a
+      // commit at 25s only as a safety valve, otherwise let the 800ms/1.6s
+      // silence endpoint decide when the user is done.
+      if (this.localSpeechMs >= 25000) {
         this.finishLocalUtterance();
       }
       return;
