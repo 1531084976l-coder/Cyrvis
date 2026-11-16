@@ -777,7 +777,6 @@ export function useVoiceAudio() {
       cleanups.forEach((cleanup) => cleanup());
       void stop();
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   useEffect(() => {

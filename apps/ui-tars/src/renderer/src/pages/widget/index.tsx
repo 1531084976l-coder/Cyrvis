@@ -24,7 +24,7 @@ import {
   UserRound,
   Volume2,
 } from 'lucide-react';
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useLayoutEffect, useRef, useState } from 'react';
 
 import { api } from '@renderer/api';
 import { Button } from '@renderer/components/ui/button';
@@ -225,6 +225,7 @@ const Widget = () => {
 
   const [activeView, setActiveView] = useState<'chat' | 'activity'>('chat');
   const scrollRef = useRef<HTMLDivElement>(null);
+  const stickToBottomRef = useRef(true);
 
   const assistantSpeaking = state?.ttsSpeaking || playbackActive;
   const voiceStatus = !state
@@ -252,12 +253,23 @@ const Widget = () => {
       : entry.kind === 'activity' || entry.kind === 'error',
   );
 
-  useEffect(() => {
-    if (!scrollRef.current) {
+  useLayoutEffect(() => {
+    const element = scrollRef.current;
+    if (!element || !stickToBottomRef.current) {
       return;
     }
-    scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
+    element.scrollTop = element.scrollHeight;
   }, [assistantText, entries.length, transcript, activeView]);
+
+  const handleScroll = useCallback(() => {
+    const element = scrollRef.current;
+    if (!element) {
+      return;
+    }
+    const distanceToBottom =
+      element.scrollHeight - element.scrollTop - element.clientHeight;
+    stickToBottomRef.current = distanceToBottom <= 32;
+  }, []);
 
   const handleOpenMainWindow = useCallback(() => {
     void api.showMainWindow();
@@ -352,6 +364,7 @@ const Widget = () => {
       <div
         ref={scrollRef}
         data-testid="cyrvis-widget-scroll"
+        onScroll={handleScroll}
         className="mt-3 min-h-0 flex-1 space-y-2 overflow-y-auto pr-1 scrollbar-thin"
       >
         {visibleEntries.map((entry) =>
