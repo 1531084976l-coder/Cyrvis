@@ -118,3 +118,9 @@
 | pnpm | 9.10.0 |
 | 浏览器 | Chrome、Edge 已安装 |
 | GitHub 直连 | 不通，使用 gh-proxy.com 克隆 |
+
+## PR #1 合并（本地集成分支）
+- [x] 备份本地修改：`backup/local-voice-fixes-20261116`，patch `D:/temp/cyrvis-local-voice-fixes.patch`。
+- [x] 在 `merge/pr-1` 上合并组员 PR #1（reference-aware echo gating + 浮动语音工作区 + 记忆）；保留 Token Plan 端点、15 秒输入缓冲清理、断线重连、耳机/外放显式按钮。
+- [x] 验证：node/web typecheck 通过；CYRVIS + shared 测试 75/75；wav-player/widgetOverlay/store 测试 9/9；`UI_TARS_APP_PRIVATE_KEY_BASE64=dummy pnpm --filter ui-tars-desktop build:dist` 通过。
+- [ ] 真机外放打断复测：合并后启动 App，切到外放时蓝牙耳机 `cc ultimate` 从 Windows 消失（只剩 ToDesk 虚拟麦），采集重试 3 次后停止；需重新连接耳机后测试，通过后再 push main。
