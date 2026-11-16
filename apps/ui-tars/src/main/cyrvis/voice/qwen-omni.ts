@@ -87,6 +87,7 @@ export class QwenOmniProvider implements VoiceProvider {
   private readonly endpoint: string;
   private readonly voice: string;
   private readonly baseInstructions: string;
+  private context = '';
   private readonly tools: QwenToolDefinition[];
   private readonly callbacks: VoiceProviderCallbacks;
   private readonly vadType: QwenVadType;
@@ -108,6 +109,10 @@ export class QwenOmniProvider implements VoiceProvider {
     this.silenceDurationMs = config.silenceDurationMs ?? 600;
     this.connectTimeoutMs = config.connectTimeoutMs ?? 15000;
     this.localVad = config.localVad ?? true;
+  }
+
+  setContext(context: string): void {
+    this.context = context.trim();
   }
 
   connect(): Promise<void> {
@@ -247,10 +252,10 @@ export class QwenOmniProvider implements VoiceProvider {
   }
 
   /** Called by the renderer when the assistant audio queue is fully played. */
-  notifyPlaybackIdle(): void {
+  notifyPlaybackIdle(tailMs = 150): void {
     // Short tail only. While the assistant speaks we detect barge-in locally
     // in the renderer, so the mic must reopen promptly when playback ends.
-    this.micMuteUntil = Date.now() + 150;
+    this.micMuteUntil = Date.now() + tailMs;
     console.log('[cyrvis provider] playback idle; mic re-enabled');
   }
 
@@ -345,7 +350,7 @@ export class QwenOmniProvider implements VoiceProvider {
       event_id: eventId('event_proactive_update'),
       type: 'session.update',
       session: {
-        instructions: `${this.baseInstructions}\n\n[系统主动播报] 现在请只用一句自然、简短的中文对用户说：${text}`,
+        instructions: `${this.instructions}\n\n[系统主动播报] 现在请只用一句自然、简短的中文对用户说：${text}`,
       },
     });
     this.send({
@@ -750,7 +755,7 @@ export class QwenOmniProvider implements VoiceProvider {
       session: {
         modalities: ['text', 'audio'],
         voice: this.voice,
-        instructions: this.baseInstructions,
+        instructions: this.instructions,
         input_audio_transcription: {
           model: 'qwen3-asr-flash-realtime',
         },
@@ -784,8 +789,20 @@ export class QwenOmniProvider implements VoiceProvider {
     this.send({
       event_id: eventId('event_restore'),
       type: 'session.update',
-      session: { instructions: this.baseInstructions },
+      session: { instructions: this.instructions },
     });
+  }
+
+  private get instructions(): string {
+    if (!this.context) {
+      return this.baseInstructions;
+    }
+    return `${this.baseInstructions}
+
+[跨会话记忆]
+以下是用户允许保留的长期偏好和最近对话。它们只用于保持连续性；如果与用户当前指令冲突，以当前指令为准。
+
+${this.context}`;
   }
 
   private failConnect(error: Error): void {

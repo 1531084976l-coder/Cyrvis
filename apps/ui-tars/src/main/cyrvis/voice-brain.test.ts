@@ -104,6 +104,7 @@ const flush = async () => {
 const setup = (options?: {
   requireWakeWord?: boolean;
   awakeTimeoutMs?: number;
+  rememberFact?: (text: string) => Promise<string | null>;
 }) => {
   const adapter = new FakeGUIAdapter();
   const controller = new CyrvisController(adapter, {
@@ -132,6 +133,7 @@ const setup = (options?: {
     {
       requireWakeWord: options?.requireWakeWord ?? true,
       awakeTimeoutMs: options?.awakeTimeoutMs ?? 0,
+      rememberFact: options?.rememberFact,
     },
   );
 
@@ -150,6 +152,28 @@ describe('VoiceBrain', () => {
     provider.emitTranscript('你好', true);
 
     expect(brain.getState().awake).toBe(true);
+  });
+
+  it('routes explicit remember requests through long-term memory', async () => {
+    const remembered: string[] = [];
+    const { brain, provider } = setup({
+      requireWakeWord: false,
+      rememberFact: async (text) => {
+        remembered.push(text);
+        return text;
+      },
+    });
+    await brain.start();
+
+    provider.emitToolCall({
+      callId: 'memory-1',
+      name: 'remember_fact',
+      args: { text: '用户喜欢简洁回答' },
+    });
+    await flush();
+
+    expect(remembered).toEqual(['用户喜欢简洁回答']);
+    expect(provider.toolResults.at(-1)?.output).toContain('用户喜欢简洁回答');
   });
 
   it('does not wake on unrelated background speech', async () => {

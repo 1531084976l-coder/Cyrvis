@@ -3,15 +3,26 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 import fs from 'node:fs';
+import { randomUUID } from 'node:crypto';
 
 import { app, BrowserWindow, globalShortcut, ipcMain } from 'electron';
 
 import * as env from '@main/env';
 import { logger } from '@main/logger';
+import {
+  describeControllerEvent,
+  describeVoiceToolCall,
+  type CyrvisActivityEvent,
+  type CyrvisMemoryTurnRole,
+  type VoiceToolName,
+} from '@shared/cyrvis';
 
 import { startCaptureService, type CaptureService } from './capture-service';
 import { CyrvisController } from './controller';
 import { ElectronGUIAdapter } from './gui-adapter';
+import { voiceMemoryService } from './memory';
+import { SpeakerEchoDetector } from './speaker-barge';
+import { isLikelySpeakerEcho } from './speaker-echo';
 import { QwenOmniProvider } from './voice/qwen-omni';
 import { VoiceBrain, type VoiceBrainState } from './voice-brain';
 import type { ControllerEvent } from './types';
@@ -26,24 +37,231 @@ let service: VoiceService | null = null;
 let captureService: CaptureService | null = null;
 let captureReady = false;
 let assistantPlaybackActive = false;
-let captureBargeMs = 0;
 let capturePreroll: Int16Array[] = [];
 let lastCaptureLogAt = 0;
 // Two selectable audio modes:
 // - headset: capture without AEC + full voice barge-in (verified)
-// - speaker: external output + AEC capture; barge-in is attempted with a
-//   higher threshold, and a short post-playback guard absorbs reverb.
+// - speaker: reference-aware echo gating plus an interrupt probe, so the
+//   assistant can still be interrupted while its own audio is playing.
 let audioMode: 'headset' | 'speaker' = 'headset';
 let speakerOutputMode = false;
 let speakerGuardUntil = 0;
+let lastAssistantText = '';
+let lastAssistantAt = 0;
 let ipcRegistered = false;
 let testAudioActive = false;
 let pttActive = false;
 // Hands-free by default. PTT remains available as a fallback mode.
-let pttMode = false;
+const pttMode = false;
 
 const CAPTURE_BARGE_THRESHOLD = 1000;
 const CAPTURE_BARGE_SUSTAIN_MS = 150;
+const SPEAKER_REVERB_GUARD_MS = 1400;
+const SPEAKER_PROBE_DECAY_MS = 220;
+const SPEAKER_PROBE_CONFIRM_MS = 140;
+const SPEAKER_PROBE_TIMEOUT_MS = 700;
+const SPEAKER_PROBE_THRESHOLD = 1100;
+const SPEAKER_RESUME_SUPPRESS_MS = 550;
+const SPEAKER_DIRECT_PREROLL_CHUNKS = 24;
+const HEADSET_REVERB_GUARD_MS = 900;
+
+interface SpeakerProbeState {
+  startedAt: number;
+  speechMs: number;
+  chunks: Int16Array[];
+}
+
+const speakerEchoDetector = new SpeakerEchoDetector();
+let speakerProbe: SpeakerProbeState | null = null;
+let speakerCandidateMs = 0;
+let speakerResumeSuppressUntil = 0;
+let lastSpeakerDiagnosticAt = 0;
+let speakerBargeStopPending = false;
+let speakerBargeStopTimer: ReturnType<typeof setTimeout> | null = null;
+
+const pushCapturePreroll = (pcm16: Int16Array): void => {
+  capturePreroll.push(pcm16.slice());
+  if (capturePreroll.length > 30) {
+    capturePreroll.shift();
+  }
+};
+
+const resetSpeakerDetection = (): void => {
+  speakerEchoDetector.reset();
+  speakerProbe = null;
+  speakerCandidateMs = 0;
+  speakerResumeSuppressUntil = 0;
+};
+
+const expectSpeakerBargeStop = (): void => {
+  speakerBargeStopPending = true;
+  if (speakerBargeStopTimer) {
+    clearTimeout(speakerBargeStopTimer);
+  }
+  speakerBargeStopTimer = setTimeout(() => {
+    speakerBargeStopTimer = null;
+    speakerBargeStopPending = false;
+  }, 1500);
+};
+
+const finishSpeakerBargeIn = (buffered: Int16Array[]): void => {
+  if (!service) {
+    return;
+  }
+
+  speakerProbe = null;
+  speakerCandidateMs = 0;
+  expectSpeakerBargeStop();
+  assistantPlaybackActive = false;
+  speakerGuardUntil = 0;
+  speakerEchoDetector.reset();
+  capturePreroll = [];
+  service.provider.bargeIn();
+  service.brain.forceAwake();
+  broadcast('cyrvis:voice:response-stopped');
+  emitActivity('speech', '已通过外放麦克风打断助手');
+  for (const chunk of buffered) {
+    service.provider.sendAudio(chunk);
+  }
+};
+
+const resumeSpeakerPlayback = (): void => {
+  speakerProbe = null;
+  speakerCandidateMs = 0;
+  speakerResumeSuppressUntil = Date.now() + SPEAKER_RESUME_SUPPRESS_MS;
+  // Keep the playback references collected before the probe. Resetting them
+  // here made the next analysis run with corr=0 and triggered a second probe
+  // for the same sentence.
+  speakerEchoDetector.setReferenceEnabled(true);
+  broadcast('cyrvis:voice:playback-resume');
+};
+
+const startSpeakerProbe = (now: number): void => {
+  speakerProbe = {
+    startedAt: now,
+    speechMs: 0,
+    chunks: [],
+  };
+  speakerCandidateMs = 0;
+  speakerEchoDetector.setReferenceEnabled(false);
+  broadcast('cyrvis:voice:playback-pause');
+  logger.info('[cyrvis speaker] playback paused for interrupt probe');
+};
+
+const handleSpeakerProbePcm = (
+  pcm16: Int16Array,
+  average: number,
+  now: number,
+): void => {
+  const probe = speakerProbe;
+  if (!probe) {
+    return;
+  }
+
+  probe.chunks.push(pcm16.slice());
+  if (probe.chunks.length > 100) {
+    probe.chunks.shift();
+  }
+  const elapsed = now - probe.startedAt;
+  if (elapsed < SPEAKER_PROBE_DECAY_MS) {
+    return;
+  }
+
+  const chunkMs = (pcm16.length / 16000) * 1000;
+  if (average > SPEAKER_PROBE_THRESHOLD) {
+    probe.speechMs += chunkMs;
+  } else {
+    probe.speechMs = Math.max(0, probe.speechMs - chunkMs);
+  }
+
+  if (probe.speechMs >= SPEAKER_PROBE_CONFIRM_MS) {
+    logger.info('[cyrvis speaker] interrupt confirmed', {
+      avg: Math.round(average),
+      elapsed,
+    });
+    const dropSamples = Math.floor((SPEAKER_PROBE_DECAY_MS * 16000) / 1000);
+    const buffered: Int16Array[] = [];
+    let remainingDrop = dropSamples;
+    for (const chunk of probe.chunks) {
+      if (remainingDrop >= chunk.length) {
+        remainingDrop -= chunk.length;
+        continue;
+      }
+      buffered.push(
+        remainingDrop > 0 ? chunk.slice(remainingDrop) : chunk.slice(),
+      );
+      remainingDrop = 0;
+    }
+    finishSpeakerBargeIn(buffered);
+    return;
+  }
+
+  if (elapsed >= SPEAKER_PROBE_TIMEOUT_MS) {
+    logger.info('[cyrvis speaker] interrupt probe rejected', {
+      elapsed,
+      speechMs: Math.round(probe.speechMs),
+    });
+    resumeSpeakerPlayback();
+  }
+};
+
+const handleSpeakerPlaybackPcm = (
+  pcm16: Int16Array,
+  average: number,
+  now: number,
+): void => {
+  if (speakerProbe) {
+    handleSpeakerProbePcm(pcm16, average, now);
+    return;
+  }
+
+  const analysis = speakerEchoDetector.analyze(pcm16, now);
+  if (now - lastSpeakerDiagnosticAt >= 1000) {
+    lastSpeakerDiagnosticAt = now;
+    logger.info('[cyrvis speaker] echo analysis', {
+      avg: Math.round(average),
+      ref: Math.round(analysis.referenceAverage * 0x8000),
+      corr: Number(analysis.correlation.toFixed(3)),
+      echo: analysis.likelyEcho,
+      ambiguous: analysis.ambiguous,
+    });
+  }
+
+  if (now < speakerResumeSuppressUntil) {
+    speakerCandidateMs = 0;
+    return;
+  }
+
+  const chunkMs = (pcm16.length / 16000) * 1000;
+  if (average <= CAPTURE_BARGE_THRESHOLD || analysis.likelyEcho) {
+    speakerCandidateMs = Math.max(0, speakerCandidateMs - chunkMs);
+    return;
+  }
+
+  speakerCandidateMs += chunkMs;
+  if (speakerCandidateMs < CAPTURE_BARGE_SUSTAIN_MS) {
+    return;
+  }
+
+  // Missing references happen between WAV segments and during device
+  // latency. In that window a loud speaker tail is indistinguishable from a
+  // user, so fail closed and wait for the next valid playback reference.
+  if (!analysis.referenceActive) {
+    speakerCandidateMs = 0;
+    return;
+  }
+
+  if (analysis.ambiguous) {
+    startSpeakerProbe(now);
+    return;
+  }
+
+  logger.info('[cyrvis speaker] direct interrupt detected', {
+    avg: Math.round(average),
+    corr: Number(analysis.correlation.toFixed(3)),
+  });
+  finishSpeakerBargeIn(capturePreroll.slice(-SPEAKER_DIRECT_PREROLL_CHUNKS));
+};
 
 /**
  * Microphone audio comes from a hidden renderer that never plays audio.
@@ -71,49 +289,26 @@ const handleCapturePcm = (pcm16: Int16Array): void => {
     });
   }
 
-  if (speakerOutputMode) {
-    // AEC in the hidden capture renderer has no reference to the main
-    // window's playback (measured self-audio 8640 during playback), so
-    // speaker mode stays half-duplex: ignore the mic while playing, plus a
-    // short reverb guard. Voice barge-in is only available in headset mode.
-    if (assistantPlaybackActive || now < speakerGuardUntil) {
-      return;
-    }
-    service.provider.sendAudio(pcm16);
-    return;
-  }
-
-  capturePreroll.push(pcm16.slice());
-  const prerollLimit = speakerOutputMode ? 15 : 30;
-  if (capturePreroll.length > prerollLimit) {
-    capturePreroll.shift();
-  }
+  pushCapturePreroll(pcm16);
 
   if (assistantPlaybackActive) {
-    const chunkMs = (pcm16.length / 16000) * 1000;
-    if (average > CAPTURE_BARGE_THRESHOLD) {
-      captureBargeMs += chunkMs;
-    } else {
-      captureBargeMs = Math.max(0, captureBargeMs - chunkMs);
-    }
-    if (captureBargeMs >= CAPTURE_BARGE_SUSTAIN_MS) {
-      logger.info('[cyrvis capture] barge-in', {
-        avg: Math.round(average),
-      });
-      assistantPlaybackActive = false;
-      captureBargeMs = 0;
-      const buffered = capturePreroll.splice(0);
-      service.provider.bargeIn();
-      service.brain.forceAwake();
-      broadcast('cyrvis:voice:response-stopped');
-      for (const chunk of buffered) {
-        service.provider.sendAudio(chunk);
-      }
-    }
+    // Reference-aware gating is always active, not only when the user has
+    // explicitly selected speaker output. The physical output device can be
+    // a laptop speaker even while the UI is still in headset mode.
+    handleSpeakerPlaybackPcm(pcm16, average, now);
     return;
   }
 
-  captureBargeMs = 0;
+  const analysis = speakerEchoDetector.analyze(pcm16, now);
+  if (analysis.likelyEcho) {
+    return;
+  }
+  const clearUserSpeech =
+    average > CAPTURE_BARGE_THRESHOLD && !analysis.ambiguous;
+  if (now < speakerGuardUntil && !clearUserSpeech) {
+    return;
+  }
+
   service.provider.sendAudio(pcm16);
 };
 
@@ -131,14 +326,19 @@ const startCapture = async (): Promise<void> => {
           mode: audioMode,
         });
         broadcast('cyrvis:voice:capture-ready', { label });
+        emitActivity('session', `麦克风已连接：${label}`);
       },
       onError: (message) => {
         captureReady = false;
         logger.error('[cyrvis capture] error', { message });
         broadcast('cyrvis:voice:capture-error', { message });
+        emitActivity('error', `麦克风连接失败：${message}`);
       },
     },
-    { echoCancellation: speakerOutputMode },
+    // The capture renderer has no reference signal from the playback
+    // renderer. Keep browser AEC off and perform reference-aware gating in
+    // the main process instead.
+    { echoCancellation: false },
   );
 };
 
@@ -150,6 +350,38 @@ const broadcast = (channel: string, payload?: unknown) => {
   }
 };
 
+const emitActivity = (
+  kind: CyrvisActivityEvent['kind'],
+  text: string,
+): void => {
+  const event: CyrvisActivityEvent = {
+    id: randomUUID(),
+    kind,
+    text,
+    createdAt: Date.now(),
+  };
+  broadcast('cyrvis:voice:activity', event);
+  void voiceMemoryService.appendActivity(event).catch((error) => {
+    logger.warn('[cyrvis memory] activity persist failed', error);
+  });
+};
+
+const syncProviderMemoryContext = async (): Promise<void> => {
+  if (!service) {
+    return;
+  }
+  service.provider.setContext(await voiceMemoryService.getContext());
+};
+
+const recordTurn = (role: CyrvisMemoryTurnRole, text: string): void => {
+  void voiceMemoryService
+    .appendTurn(role, text)
+    .then(() => syncProviderMemoryContext())
+    .catch((error) => {
+      logger.warn('[cyrvis memory] turn persist failed', error);
+    });
+};
+
 const broadcastPtt = () => {
   broadcast('cyrvis:voice:ptt', { active: pttActive, mode: pttMode });
 };
@@ -159,11 +391,14 @@ const triggerBargeIn = () => {
     return;
   }
   logger.info('[cyrvis voice] barge-in');
+  expectSpeakerBargeStop();
   assistantPlaybackActive = false;
-  captureBargeMs = 0;
+  capturePreroll = [];
+  resetSpeakerDetection();
   service.provider.bargeIn();
   service.brain.forceAwake();
   broadcast('cyrvis:voice:response-stopped');
+  emitActivity('speech', '已打断助手回答');
 };
 
 const setPttActive = (active: boolean) => {
@@ -217,11 +452,33 @@ const registerVoiceIpc = () => {
     return service?.brain.getState() ?? null;
   });
 
+  ipcMain.handle('cyrvis:voice:get-memory', () => {
+    return voiceMemoryService.getSnapshot();
+  });
+
+  ipcMain.handle('cyrvis:voice:get-capture-ready', () => ({
+    ready: captureReady,
+  }));
+
   ipcMain.handle('cyrvis:voice:cancel-task', async () => {
     if (!service) {
       return null;
     }
     return service.controller.cancelTask();
+  });
+
+  ipcMain.handle('cyrvis:voice:pause-task', async () => {
+    if (!service) {
+      return null;
+    }
+    return service.controller.pauseTask();
+  });
+
+  ipcMain.handle('cyrvis:voice:resume-task', async () => {
+    if (!service) {
+      return null;
+    }
+    return service.controller.resumeTask();
   });
 
   ipcMain.on('cyrvis:voice:audio', (_event, buffer: ArrayBuffer) => {
@@ -233,6 +490,16 @@ const registerVoiceIpc = () => {
     }
     service.provider.sendAudio(new Int16Array(buffer));
   });
+
+  ipcMain.on(
+    'cyrvis:voice:playback-reference',
+    (_event, buffer: ArrayBuffer) => {
+      if (speakerProbe || !(buffer instanceof ArrayBuffer)) {
+        return;
+      }
+      speakerEchoDetector.addReference(new Int16Array(buffer), Date.now());
+    },
+  );
 
   ipcMain.handle('cyrvis:voice:test-audio', async () => {
     if (!env.isDev || !service) {
@@ -311,11 +578,14 @@ const registerVoiceIpc = () => {
     audioMode = nextMode;
     speakerOutputMode = nextMode === 'speaker';
     speakerGuardUntil = 0;
-    captureBargeMs = 0;
     capturePreroll = [];
+    if (speakerProbe) {
+      broadcast('cyrvis:voice:playback-resume');
+    }
+    resetSpeakerDetection();
     logger.info('[cyrvis voice] audio mode', {
       mode: audioMode,
-      echoCancellation: speakerOutputMode,
+      echoCancellation: false,
     });
     broadcast('cyrvis:voice:audio-mode', { mode: audioMode });
     if (changed) {
@@ -340,9 +610,12 @@ const registerVoiceIpc = () => {
     const changed = audioMode !== nextMode;
     audioMode = nextMode;
     speakerOutputMode = nextMode === 'speaker';
+    if (speakerProbe) {
+      broadcast('cyrvis:voice:playback-resume');
+    }
+    resetSpeakerDetection();
     if (speakerOutputMode) {
       speakerGuardUntil = 0;
-      captureBargeMs = 0;
       capturePreroll = [];
     }
     logger.info('[cyrvis voice] output mode', {
@@ -373,10 +646,21 @@ const registerVoiceIpc = () => {
   });
 
   ipcMain.on('cyrvis:voice:playback-idle', () => {
+    const bargeStopPending = speakerBargeStopPending;
+    speakerBargeStopPending = false;
+    if (speakerBargeStopTimer) {
+      clearTimeout(speakerBargeStopTimer);
+      speakerBargeStopTimer = null;
+    }
     assistantPlaybackActive = false;
-    captureBargeMs = 0;
-    speakerGuardUntil = speakerOutputMode ? Date.now() + 800 : 0;
-    service?.provider.notifyPlaybackIdle();
+    resetSpeakerDetection();
+    speakerGuardUntil = !bargeStopPending
+      ? Date.now() +
+        (speakerOutputMode ? SPEAKER_REVERB_GUARD_MS : HEADSET_REVERB_GUARD_MS)
+      : 0;
+    service?.provider.notifyPlaybackIdle(
+      speakerOutputMode && !bargeStopPending ? 150 : 0,
+    );
   });
 
   ipcMain.on('cyrvis:voice:barge-in', () => {
@@ -397,6 +681,11 @@ const registerVoiceIpc = () => {
  * No-op when QWEN_API_KEY is absent.
  */
 export const startVoiceService = (): VoiceService | null => {
+  // Keep the renderer control surface available even when the model key is
+  // missing. It reports a clean "not configured" state instead of exposing
+  // Electron's missing IPC handler error in the floating panel.
+  registerVoiceIpc();
+
   if (service) {
     return service;
   }
@@ -427,47 +716,90 @@ export const startVoiceService = (): VoiceService | null => {
         logger.info('[cyrvis voice] speech stopped');
         broadcast('cyrvis:voice:speech-stopped');
       },
-      onTranscript: (text, final) =>
-        broadcast('cyrvis:voice:transcript', { text, final }),
+      onTranscript: (text, final) => {
+        broadcast('cyrvis:voice:transcript', { text, final });
+        if (final) {
+          recordTurn('user', text);
+        }
+      },
       onAssistantText: (text, final) => {
         logger.info('[cyrvis voice] assistant text', { text, final });
         broadcast('cyrvis:voice:assistant', { text, final });
+        lastAssistantAt = Date.now();
+        lastAssistantText = final ? text : `${lastAssistantText}${text}`;
+        if (final) {
+          recordTurn('assistant', text);
+        }
       },
       onState: (state: VoiceBrainState) =>
         broadcast('cyrvis:voice:state', state),
       onWake: () => {
         logger.info('[cyrvis voice] wake');
         broadcast('cyrvis:voice:wake');
+        emitActivity('session', '语音会话已唤醒');
       },
       onSleep: () => {
         logger.info('[cyrvis voice] sleep');
         broadcast('cyrvis:voice:sleep');
+        emitActivity('session', '语音会话已休眠');
       },
-      onTaskEvent: (event: ControllerEvent) =>
-        broadcast('cyrvis:voice:task-event', event),
-      onError: (error) => logger.error('[cyrvis voice] error', error),
+      onTaskEvent: (event: ControllerEvent) => {
+        broadcast('cyrvis:voice:task-event', event);
+        const text = describeControllerEvent(event);
+        if (text) {
+          emitActivity(event.type === 'task_failed' ? 'error' : 'task', text);
+        }
+      },
+      onError: (error) => {
+        logger.error('[cyrvis voice] error', error);
+        emitActivity('error', `语音服务错误：${error.message}`);
+      },
     },
     (callbacks) => {
       const wrapped = {
         ...callbacks,
         onReady: () => {
           logger.info('[cyrvis voice] qwen session ready');
+          emitActivity('session', 'Qwen Realtime 已连接');
           callbacks.onReady?.();
         },
         onTranscript: (text: string, final: boolean) => {
           logger.info('[cyrvis voice] transcript', { text, final });
+          if (
+            final &&
+            isLikelySpeakerEcho(
+              text,
+              lastAssistantText,
+              Date.now() - lastAssistantAt,
+            )
+          ) {
+            logger.warn('[cyrvis voice] ignored likely speaker echo', {
+              transcript: text,
+            });
+            provider?.cancelResponse();
+            provider?.clearAudioBuffer();
+            broadcast('cyrvis:voice:transcript', { text: '', final: true });
+            emitActivity('speech', '已忽略外放回声，未触发追问');
+            return;
+          }
           callbacks.onTranscript?.(text, final);
         },
         onResponseStarted: () => {
+          speakerBargeStopPending = false;
+          if (speakerBargeStopTimer) {
+            clearTimeout(speakerBargeStopTimer);
+            speakerBargeStopTimer = null;
+          }
+          resetSpeakerDetection();
           assistantPlaybackActive = true;
-          captureBargeMs = 0;
           capturePreroll = [];
           speakerGuardUntil = 0;
-          if (speakerOutputMode) {
-            // Drop any residual speaker/TTS audio still in the ASR buffer.
-            service?.provider.clearAudioBuffer();
-          }
+          lastAssistantText = '';
+          // Never carry playback-tail audio into the next ASR turn, regardless
+          // of which output mode the UI currently reports.
+          service?.provider.clearAudioBuffer();
           broadcast('cyrvis:voice:response-started');
+          emitActivity('speech', '助手开始流式回答');
           callbacks.onResponseStarted?.();
         },
         onResponseDone: () => {
@@ -475,6 +807,7 @@ export const startVoiceService = (): VoiceService | null => {
           // its half-duplex gate does not stay closed for the watchdog period
           // and swallow the user's next words (e.g. "stop").
           broadcast('cyrvis:voice:response-done');
+          emitActivity('speech', '助手回答完成');
           callbacks.onResponseDone?.();
         },
         onUtteranceCommitted: () => {
@@ -485,16 +818,32 @@ export const startVoiceService = (): VoiceService | null => {
           // speech and the first response token, so the user does not repeat
           // themselves thinking they were not heard.
           broadcast('cyrvis:voice:thinking');
+          emitActivity('speech', '正在理解语音指令');
           callbacks.onUtteranceCommitted?.();
         },
         onToolCall: (
           call: Parameters<NonNullable<typeof callbacks.onToolCall>>[0],
         ) => {
           logger.info('[cyrvis voice] tool call', call.name, call.args);
+          const instruction =
+            call.name === 'start_gui_task'
+              ? call.args.instruction
+              : call.name === 'remember_fact'
+                ? call.args.text
+                : undefined;
+          broadcast('cyrvis:voice:tool-call', {
+            name: call.name,
+            instruction,
+          });
+          emitActivity(
+            call.name === 'remember_fact' ? 'memory' : 'tool',
+            describeVoiceToolCall(call.name as VoiceToolName, instruction),
+          );
           callbacks.onToolCall?.(call);
         },
         onError: (error: Error) => {
           logger.error('[cyrvis voice] provider error', error);
+          emitActivity('error', `语音模型错误：${error.message}`);
           callbacks.onError?.(error);
         },
       };
@@ -520,11 +869,18 @@ export const startVoiceService = (): VoiceService | null => {
         minGapMs: 5000,
         progressCooldownMs: 30000,
       },
+      memoryContextProvider: () => voiceMemoryService.getContext(),
+      rememberFact: async (text) => {
+        const remembered = await voiceMemoryService.rememberFact(text);
+        if (remembered) {
+          emitActivity('memory', `已保存长期记忆：${remembered}`);
+        }
+        return remembered;
+      },
     },
   );
 
   service = { brain, provider, controller };
-  registerVoiceIpc();
 
   if (pttMode) {
     const shortcutRegistered = globalShortcut.register(

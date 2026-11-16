@@ -91,4 +91,23 @@ export const CYRVIS_VOICE_TOOLS: QwenToolDefinition[] = [
       },
     },
   },
+  {
+    type: 'function',
+    function: {
+      name: 'remember_fact',
+      description:
+        'Store a durable user preference, identity fact, or recurring context after the user explicitly asks you to remember it. Never store passwords, API keys, tokens, or other secrets.',
+      parameters: {
+        type: 'object',
+        properties: {
+          text: {
+            type: 'string',
+            description:
+              'A concise, self-contained fact or preference to retain across sessions.',
+          },
+        },
+        required: ['text'],
+      },
+    },
+  },
 ];

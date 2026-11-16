@@ -13,6 +13,7 @@ import {
   SearchEngineForSettings,
   VLMProviderV2,
   Operator,
+  WidgetOverlayMode,
 } from './types';
 import { validatePreset } from './validate';
 import { BrowserWindow } from 'electron';
@@ -27,6 +28,7 @@ export const DEFAULT_SETTING: LocalStore = {
   maxLoopCount: 100,
   loopIntervalInMs: 1000,
   searchEngineForBrowser: SearchEngineForSettings.GOOGLE,
+  widgetOverlayMode: WidgetOverlayMode.AlwaysOnTop,
   operator: Operator.LocalComputer,
   reportStorageBaseUrl: '',
   utioBaseUrl: '',
