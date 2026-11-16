@@ -133,3 +133,5 @@
 - [x] 减少蓝牙麦掉线：外放模式不再把 Windows 三个默认角色全部切到 Realtek；roles 0/1（普通/多媒体）切扬声器，role 2（通信）保留在 `cc ultimate` 耳机，避免 Windows 拆掉 HFP 麦克风。脚本实测外放 target=Realtek、role 0/1 hr=0；耳机存在时应额外输出 `role=2 (comm/headset)`。
 - [x] 修复“喊停后停一下又继续”：日志显示 barge 成功后模型又生成“好的，已暂停当前任务”并播放。新增 bare stop 抑制：识别“停/停止/暂停/别说了”等短指令后取消当前响应，并在 2 秒内不再播放模型确认语；新增单测（19/19）。
 - [x] 探针时序从 220ms decay + 140ms confirm 改为 80ms + 100ms，避免 200–300ms 的“停”被全部丢弃；外放探针现在能确认更短的口令。
+- [x] 修复 barge 后长语音丢失：日志显示 22:34:38 barge 成功后只捕获 200ms 就 commit，随后 22:34:39–42 用户继续说的长段（avg 1859/7087/4143）因 `awaitingResponse` 半双工被丢弃，22:35:01 只转写出 “Ok.”。已加 post-barge 静音窗口 1600ms，给用户继续说完的机会，避免 800ms 就把短停顿当成本轮结束。
+- [ ] 模型质量：Token Plan 只有 `qwen-audio-3.0-realtime-plus`；`qwen3.8-omni-flash-realtime` 在 Token Plan 返回 `Model not exist`。当前 ASR 误识别明显（Hello CYRVIS → Hello service，长段 → Ok.），要回到 qwen3.8 需要公共 DashScope 的付费/额度 Key。

@@ -84,6 +84,11 @@ export class QwenOmniProvider implements VoiceProvider {
   private responseAudioBytes = 0;
   private suppressAudio = false;
   private forceNextCommit = false;
+  // After barge-in the user often pauses briefly and then continues the same
+  // thought. A normal 800ms endpoint committed the first 200ms and dropped the
+  // rest while the new response was generating. Give the next utterance a
+  // longer silence window.
+  private postBargeSilenceMs = 0;
   private audioChunkCount = 0;
   // Qwen Audio 3.x rejects a continuous input buffer after 30s. The local VAD
   // only commits after speech, so idle room noise can otherwise fill the
@@ -310,6 +315,7 @@ export class QwenOmniProvider implements VoiceProvider {
     this.cancelResponse();
     this.micMuteUntil = 0;
     this.clearAudioBuffer();
+    this.postBargeSilenceMs = 1600;
   }
 
   /** Called when the user releases/stops push-to-talk. */
@@ -790,13 +796,18 @@ export class QwenOmniProvider implements VoiceProvider {
     }
 
     this.localSilenceMs += chunkMs;
-    if (this.localSilenceMs >= this.silenceDurationMs) {
+    const requiredSilence = Math.max(
+      this.silenceDurationMs,
+      this.postBargeSilenceMs,
+    );
+    if (this.localSilenceMs >= requiredSilence) {
       this.finishLocalUtterance();
     }
   }
 
   private finishLocalUtterance(): void {
     const speechMs = this.localSpeechMs;
+    this.postBargeSilenceMs = 0;
     // A short "Hello CYRVIS" can be 300-500 ms. Requiring 600 ms made the
     // first attempt look like the assistant was deaf and forced repeats.
     // After a barge-in the renderer already detected a real voice, so a short
