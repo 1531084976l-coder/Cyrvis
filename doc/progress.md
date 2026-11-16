@@ -130,3 +130,4 @@
 - [x] 修复 barge 后误重连：cancel 竞态的服务端 error 被当成致命错误，导致每次打断后 `sleep`/重连；现只对 `input buffer exceeded`/session 失效重连，其他 error 仅记录。
 - [x] 重连后重新触发 `onReady` 并 `wake`，修复“耳机模式转写了但 asleep 忽略、无声音”。
 - [ ] 蓝牙耳机在多次重启/切模式后又从 Windows 消失，当前采集无法启动；重新连接后再做一次真人“停”复测。
+- [x] 减少蓝牙麦掉线：外放模式不再把 Windows 三个默认角色全部切到 Realtek；roles 0/1（普通/多媒体）切扬声器，role 2（通信）保留在 `cc ultimate` 耳机，避免 Windows 拆掉 HFP 麦克风。脚本实测外放 target=Realtek、role 0/1 hr=0；耳机存在时应额外输出 `role=2 (comm/headset)`。

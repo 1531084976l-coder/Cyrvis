@@ -96,9 +96,31 @@ if (-not $target) {
 }
 
 $results = @()
-foreach ($role in 0, 1, 2) {
+# In speaker mode, leave the *communications* role on the headset. Setting all
+# three roles to Realtek makes Windows tear down the Bluetooth HFP microphone,
+# so the next capture restart finds "No physical microphone".
+$roles = if ($Kind -eq "speaker" -and -not $Match) { @(0, 1) } else { @(0, 1, 2) }
+foreach ($role in $roles) {
   $hr = [AudioPolicy]::SetDefault($target.EndpointId, $role)
   $results += "role=$role hr=$hr"
+}
+if ($Kind -eq "speaker" -and -not $Match) {
+  $comm = $render | Where-Object { $_.FriendlyName -like '*cc ultimate*' } |
+    Select-Object -First 1
+  if (-not $comm) {
+    $comm = $render |
+      Where-Object {
+        $_.FriendlyName -notlike '*Realtek*' -and
+        $_.FriendlyName -notlike '*NVIDIA*' -and
+        $_.FriendlyName -notlike '*ToDesk*' -and
+        $_.FriendlyName -notlike '*Digital*'
+      } |
+      Select-Object -First 1
+  }
+  if ($comm) {
+    $hr = [AudioPolicy]::SetDefault($comm.EndpointId, 2)
+    $results += "role=2 (comm/headset) hr=$hr target=$($comm.FriendlyName)"
+  }
 }
 Write-Output ("target: " + $target.FriendlyName)
 Write-Output ("endpoint: " + $target.EndpointId)
