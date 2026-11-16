@@ -195,6 +195,23 @@ export class VoiceBrain {
     this.suppressReplyUntil = Date.now() + 2000;
   }
 
+  /**
+   * Deterministic barge stop. Do not wait for ASR: a confirmed barge may be a
+   * short "停" that the model hears as empty or something else several seconds
+   * later. Pause the GUI task and keep the assistant silent.
+   */
+  handleBargeStop(): void {
+    this.markUserStop();
+    const status = this.controller.getStatus().status;
+    if (['starting', 'executing', 'paused'].includes(status)) {
+      void this.controller.pauseTask().catch((error: unknown) => {
+        this.callbacks.onError?.(
+          error instanceof Error ? error : new Error(String(error)),
+        );
+      });
+    }
+  }
+
   sleep(): void {
     if (!this.awake) {
       return;

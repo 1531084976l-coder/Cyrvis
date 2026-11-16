@@ -178,7 +178,7 @@ const expectSpeakerBargeStop = (): void => {
   }, 1500);
 };
 
-const finishSpeakerBargeIn = (buffered: Int16Array[]): void => {
+const finishSpeakerBargeIn = (_buffered: Int16Array[]): void => {
   if (!service) {
     return;
   }
@@ -191,13 +191,11 @@ const finishSpeakerBargeIn = (buffered: Int16Array[]): void => {
   speakerEchoDetector.reset();
   capturePreroll = [];
   service.provider.bargeIn();
+  service.provider.muteMicFor(900);
   service.brain.forceAwake();
-  service.brain.markUserStop();
+  service.brain.handleBargeStop();
   broadcast('cyrvis:voice:response-stopped');
   emitActivity('speech', '已通过外放麦克风打断助手');
-  for (const chunk of buffered) {
-    service.provider.sendAudio(chunk);
-  }
 };
 
 const resumeSpeakerPlayback = (): void => {
@@ -396,14 +394,12 @@ const handleCapturePcm = (pcm16: Int16Array): void => {
       });
       headsetBargeMs = 0;
       assistantPlaybackActive = false;
-      const buffered = capturePreroll.splice(0);
+      capturePreroll = [];
       service.provider.bargeIn();
+      service.provider.muteMicFor(900);
       service.brain.forceAwake();
-      service.brain.markUserStop();
+      service.brain.handleBargeStop();
       broadcast('cyrvis:voice:response-stopped');
-      for (const chunk of buffered) {
-        service.provider.sendAudio(chunk);
-      }
     }
     return;
   }
@@ -566,13 +562,17 @@ const triggerBargeIn = () => {
     return;
   }
   logger.info('[cyrvis voice] barge-in');
+  const wasPlaying = assistantPlaybackActive;
   expectSpeakerBargeStop();
   assistantPlaybackActive = false;
   capturePreroll = [];
   resetSpeakerDetection();
   service.provider.bargeIn();
+  if (wasPlaying) {
+    service.provider.muteMicFor(900);
+  }
   service.brain.forceAwake();
-  service.brain.markUserStop();
+  service.brain.handleBargeStop();
   broadcast('cyrvis:voice:response-stopped');
   emitActivity('speech', '已打断助手回答');
 };

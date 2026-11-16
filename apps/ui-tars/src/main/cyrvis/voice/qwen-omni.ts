@@ -318,6 +318,12 @@ export class QwenOmniProvider implements VoiceProvider {
     this.postBargeSilenceMs = 1600;
   }
 
+  /** Hard stop: keep the mic closed while the TTS tail decays. */
+  muteMicFor(ms: number): void {
+    this.micMuteUntil = Math.max(this.micMuteUntil, Date.now() + ms);
+    this.clearAudioBuffer();
+  }
+
   /** Called when the user releases/stops push-to-talk. */
   endPtt(): void {
     if (this.localSpeechActive) {
