@@ -296,3 +296,37 @@ cancelling
 - sherpa-onnx KWS model: https://github.com/k2-fsa/sherpa-onnx/releases/download/kws-models/sherpa-onnx-kws-zipformer-wenetspeech-3.3M-2024-01-01.tar.bz2
 - Windows AEC control: https://learn.microsoft.com/windows/win32/api/audioclient/
 - Hugging Face speech-to-speech: https://github.com/huggingface/speech-to-speech
+
+## 13. Phase 1 实测补充（2026-11-17）
+
+使用真实录音：
+
+- 外放：Realtek `tts-probe.wav`（Qwen TTS，约 9s）；
+- 麦克风：`cc ultimate`，44.1k 录制后转 16k；
+- 参考：同一段 TTS 16k。
+
+结果：
+
+| 测试 | 结果 |
+|---|---|
+| 纯回声 AEC | ERLE **42.6dB**，AEC 后接近静音 |
+| 用户单独说话 + 远端 TTS 活跃 | AEC 对人声衰减 **-8.2dB**（`EchoCanceller` 与 `AudioProcessor` 相同） |
+| 双讲（回声+用户）声纹 | 混合 0.643 → AEC 后 0.344–0.419 |
+| ASR：混合音频 | “你好，我叫徐世华，本科长春师范大学…” 基本可转写 |
+| ASR：AEC 后 | “徐志华，我是武汉大学毕业…” 出现丢字/改词 |
+
+结论：
+
+1. AEC3 消回声有效，但默认的 near-end suppression/双讲处理会压人声；
+2. 对语音识别来说，AEC 输出不一定优于原始混合音频；
+3. 不能把“AEC 后直接接声纹/ASR”当成必然正确，需要：
+   - 关闭/降低 NS、调整 AEC 双讲策略；
+   - 或使用 **Soft barge：AEC 检测到近端后先压低 TTS，再对原始/混合音频做 ASR**；
+   - 或对 AEC 输出与原始 near 做可调混合（保留人声，牺牲部分回声）。
+
+因此 Phase 2 不应直接上线实时 AEC，而应先做 **AEC 参数/双讲对照实验**：
+
+- AEC only、AEC+NS、AEC+NS+AGC；
+- AEC 输出与 raw near 的混合比例 0/25/50/75%；
+- 真实双讲录音（用户实际说“停”“新任务”），而不是合成叠加；
+- 以 KWS/ASR 结果为准，不以声纹分数单独判定。
