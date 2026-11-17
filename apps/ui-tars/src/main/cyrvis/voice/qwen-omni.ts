@@ -21,6 +21,7 @@ export interface QwenOmniConfig {
   model?: string;
   /** Full WebSocket URL; defaults to the DashScope realtime endpoint. */
   endpoint?: string;
+  workspaceId?: string;
   voice?: string;
   instructions?: string;
   tools?: QwenToolDefinition[];
@@ -85,6 +86,7 @@ export class QwenOmniProvider implements VoiceProvider {
   private readonly apiKey: string;
   private readonly model: string;
   private readonly endpoint: string;
+  private readonly workspaceId?: string;
   private readonly voice: string;
   private readonly baseInstructions: string;
   private readonly tools: QwenToolDefinition[];
@@ -100,6 +102,7 @@ export class QwenOmniProvider implements VoiceProvider {
     this.endpoint =
       config.endpoint ||
       `wss://dashscope.aliyuncs.com/api-ws/v1/realtime?model=${this.model}`;
+    this.workspaceId = config.workspaceId;
     this.voice = config.voice || 'Tina';
     this.baseInstructions = config.instructions || DEFAULT_VOICE_INSTRUCTIONS;
     this.tools = config.tools || CYRVIS_VOICE_TOOLS;
@@ -150,7 +153,12 @@ export class QwenOmniProvider implements VoiceProvider {
       this.pendingConnect = { resolve, reject, timer };
 
       const ws = new WebSocket(this.endpoint, {
-        headers: { Authorization: `Bearer ${this.apiKey}` },
+        headers: {
+          Authorization: `Bearer ${this.apiKey}`,
+          ...(this.workspaceId
+            ? { 'X-DashScope-WorkSpace': this.workspaceId }
+            : {}),
+        },
       });
       this.ws = ws;
 
@@ -166,13 +174,36 @@ export class QwenOmniProvider implements VoiceProvider {
         this.scheduleReconnect();
       });
 
-      ws.on('close', (_code, reason) => {
+      ws.on('unexpected-response', (_request, response) => {
+        let body = '';
+        response.setEncoding('utf8');
+        response.on('data', (chunk: string) => {
+          if (body.length < 2000) body += chunk;
+        });
+        response.on('end', () => {
+          const detail = body.trim() || response.statusMessage || 'no details';
+          const error = new Error(
+            `Qwen realtime handshake rejected (${response.statusCode}): ${detail}`,
+          );
+          this.callbacks.onError?.(error);
+          this.failConnect(error);
+          try {
+            ws.terminate();
+          } catch {
+            // Socket may already be closed by the server.
+          }
+        });
+      });
+
+      ws.on('close', (code, reason) => {
         this.connected = false;
         this.ws = null;
         this.localSpeechActive = false;
         this.responseActive = false;
         this.failConnect(
-          new Error(`Qwen realtime closed: ${reason.toString()}`),
+          new Error(
+            `Qwen realtime closed (${code}): ${reason.toString() || 'no reason supplied'}`,
+          ),
         );
         this.callbacks.onClose?.();
         this.scheduleReconnect();

@@ -416,6 +416,17 @@ export const startVoiceService = (): VoiceService | null => {
     return null;
   }
 
+  const model = process.env.QWEN_MODEL || 'qwen3.8-omni-flash-realtime';
+  const workspaceId = process.env.QWEN_WORKSPACE_ID?.trim();
+  const endpoint = workspaceId
+    ? `wss://${workspaceId}.cn-beijing.maas.aliyuncs.com/api-ws/v1/realtime?model=${encodeURIComponent(model)}`
+    : undefined;
+  if (model.startsWith('qwen3.8-') && !workspaceId) {
+    logger.warn(
+      '[cyrvis voice] QWEN_WORKSPACE_ID is required for Qwen 3.8 realtime',
+    );
+  }
+
   const controller = new CyrvisController(new ElectronGUIAdapter());
   let provider!: QwenOmniProvider;
 
@@ -508,7 +519,9 @@ export const startVoiceService = (): VoiceService | null => {
 
       provider = new QwenOmniProvider({
         apiKey,
-        model: process.env.QWEN_MODEL || 'qwen3.8-omni-flash-realtime',
+        model,
+        endpoint,
+        workspaceId,
         callbacks: wrapped,
         vadType: 'semantic_vad_ec',
         // 1.2s felt like the assistant was deaf: users repeat "Hello" before
