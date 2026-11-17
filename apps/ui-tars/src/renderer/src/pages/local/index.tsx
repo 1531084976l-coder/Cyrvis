@@ -32,6 +32,7 @@ import { PredictionParsed, StatusEnum } from '@ui-tars/shared/types';
 import { RouterState } from '../../typings';
 import ChatInput from '../../components/ChatInput';
 import { NavDialog } from '../../components/AlertDialog/navDialog';
+import { Operator } from '@main/store/types';
 import {
   checkVLMSettings,
   LocalSettingsDialog,
@@ -47,7 +48,10 @@ const getFinishedContent = (predictionParsed?: PredictionParsed[]) =>
   )?.action_inputs?.content as string | undefined;
 
 const LocalOperator = () => {
-  const state = useLocation().state as RouterState;
+  const location = useLocation();
+  const routeState = location.state as Partial<RouterState> | null;
+  const operator = routeState?.operator ?? Operator.LocalComputer;
+  const routeSessionId = routeState?.sessionId ?? '';
   const navigate = useNavigate();
   const { setOpen } = useSidebar();
 
@@ -68,27 +72,63 @@ const LocalOperator = () => {
   );
   const [isNavDialogOpen, setNavDialogOpen] = useState(false);
   const [localOpen, setLocalOpen] = useState(false);
+  const creatingInitialSessionRef = useRef(false);
+  const activeSessionId = routeSessionId || currentSessionId;
 
   useEffect(() => {
+    let cancelled = false;
+
     const update = async () => {
-      if (state.sessionId) {
-        await setActiveSession(state.sessionId);
-        setInitId(state.sessionId);
+      setOpen(false);
+
+      if (routeSessionId) {
+        await setActiveSession(routeSessionId);
+        if (!cancelled) {
+          setInitId(routeSessionId);
+        }
+        return;
       }
+
+      if (creatingInitialSessionRef.current) {
+        return;
+      }
+      creatingInitialSessionRef.current = true;
+
+      const session = await createSession('New Session', { operator });
+      if (cancelled || !session) {
+        if (!cancelled) {
+          creatingInitialSessionRef.current = false;
+        }
+        return;
+      }
+
+      setInitId(session.id);
+      navigate('/local', {
+        replace: true,
+        state: {
+          operator,
+          sessionId: session.id,
+          from: 'new',
+        },
+      });
     };
-    update();
-    setOpen(false);
-  }, [state.sessionId]);
+
+    void update();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [routeSessionId, operator]);
 
   useEffect(() => {
-    if (initId !== state.sessionId) {
+    if (!routeSessionId || initId !== routeSessionId) {
       return;
     }
 
     if (
-      state.sessionId &&
+      routeSessionId &&
       currentSessionId &&
-      state.sessionId !== currentSessionId
+      routeSessionId !== currentSessionId
     ) {
       return;
     }
@@ -107,11 +147,11 @@ const LocalOperator = () => {
       );
       const allMessages = [...chatMessages, ...newMessages];
 
-      updateMessages(state.sessionId, allMessages);
+      updateMessages(routeSessionId, allMessages);
     }
   }, [
     initId,
-    state.sessionId,
+    routeSessionId,
     currentSessionId,
     chatMessages.length,
     messages.length,
@@ -139,17 +179,17 @@ const LocalOperator = () => {
 
   const onNewChat = useCallback(async () => {
     const session = await createSession('New Session', {
-      operator: state.operator,
+      operator,
     });
 
     navigate('/local', {
       state: {
-        operator: state.operator,
+        operator,
         sessionId: session?.id,
         from: 'new',
       },
     });
-  }, []);
+  }, [operator]);
 
   const onBack = useCallback(async () => {
     navigate('/');
@@ -271,7 +311,7 @@ const LocalOperator = () => {
   return (
     <div className="flex flex-col w-full h-full">
       <NavHeader
-        title={state.operator}
+        title={operator}
         onBack={handleBack}
         docUrl="https://github.com/bytedance/UI-TARS-desktop/"
       ></NavHeader>
@@ -289,9 +329,9 @@ const LocalOperator = () => {
           </div>
           {renderChatList()}
           <ChatInput
-            disabled={false}
-            operator={state.operator}
-            sessionId={state.sessionId}
+            disabled={!activeSessionId}
+            operator={operator}
+            sessionId={activeSessionId}
             checkBeforeRun={checkVLM}
           />
         </Card>

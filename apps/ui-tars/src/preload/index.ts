@@ -8,6 +8,14 @@ import { IpcRendererEvent, contextBridge, ipcRenderer } from 'electron';
 import type { UTIOPayload } from '@ui-tars/utio';
 
 import type { AppState, LocalStore } from '@main/store/types';
+import type {
+  ControllerEvent,
+  CyrvisActivityEvent,
+  CyrvisMemorySnapshot,
+  CyrvisVoiceState,
+  TaskSnapshot,
+  VoiceToolName,
+} from '@shared/cyrvis';
 
 export type Channels = '';
 
@@ -116,6 +124,10 @@ const electronHandler = {
         ipcRenderer.removeListener('cyrvis:voice:capture-error', listener);
     },
     restartCapture: () => ipcRenderer.invoke('cyrvis:voice:restart-capture'),
+    getCaptureReady: () =>
+      ipcRenderer.invoke('cyrvis:voice:get-capture-ready') as Promise<{
+        ready: boolean;
+      }>,
     setOutput: (label: string) =>
       ipcRenderer.invoke('cyrvis:voice:set-output', label),
     onSetOutput: (callback: (label: string) => void) => {
@@ -154,10 +166,26 @@ const electronHandler = {
       return () => ipcRenderer.removeListener('cyrvis:voice:ptt', listener);
     },
     getState: () => ipcRenderer.invoke('cyrvis:voice:get-state'),
+    getMemory: () =>
+      ipcRenderer.invoke(
+        'cyrvis:voice:get-memory',
+      ) as Promise<CyrvisMemorySnapshot>,
     cancelTask: () => ipcRenderer.invoke('cyrvis:voice:cancel-task'),
+    pauseTask: () =>
+      ipcRenderer.invoke(
+        'cyrvis:voice:pause-task',
+      ) as Promise<TaskSnapshot | null>,
+    resumeTask: () =>
+      ipcRenderer.invoke(
+        'cyrvis:voice:resume-task',
+      ) as Promise<TaskSnapshot | null>,
     sendAudio: (buffer: ArrayBuffer) =>
       ipcRenderer.send('cyrvis:voice:audio', buffer),
+    sendPlaybackReference: (buffer: ArrayBuffer, startedAt?: number) =>
+      ipcRenderer.send('cyrvis:voice:playback-reference', buffer, startedAt),
     notifyPlaybackIdle: () => ipcRenderer.send('cyrvis:voice:playback-idle'),
+    notifyPlaybackStopped: (info?: { queuedMs?: number }) =>
+      ipcRenderer.send('cyrvis:voice:playback-stopped', info),
     bargeIn: () => ipcRenderer.send('cyrvis:voice:barge-in'),
     forceAwake: () => ipcRenderer.send('cyrvis:voice:force-awake'),
     sleep: () => ipcRenderer.send('cyrvis:voice:sleep'),
@@ -210,18 +238,36 @@ const electronHandler = {
       return () =>
         ipcRenderer.removeListener('cyrvis:voice:assistant', listener);
     },
-    onState: (callback: (state: unknown) => void) => {
-      const listener = (_event: IpcRendererEvent, state: unknown) =>
+    onState: (callback: (state: CyrvisVoiceState) => void) => {
+      const listener = (_event: IpcRendererEvent, state: CyrvisVoiceState) =>
         callback(state);
       ipcRenderer.on('cyrvis:voice:state', listener);
       return () => ipcRenderer.removeListener('cyrvis:voice:state', listener);
     },
-    onTaskEvent: (callback: (event: unknown) => void) => {
-      const listener = (_event: IpcRendererEvent, event: unknown) =>
+    onTaskEvent: (callback: (event: ControllerEvent) => void) => {
+      const listener = (_event: IpcRendererEvent, event: ControllerEvent) =>
         callback(event);
       ipcRenderer.on('cyrvis:voice:task-event', listener);
       return () =>
         ipcRenderer.removeListener('cyrvis:voice:task-event', listener);
+    },
+    onToolCall: (
+      callback: (call: { name: VoiceToolName; instruction?: string }) => void,
+    ) => {
+      const listener = (
+        _event: IpcRendererEvent,
+        call: { name: VoiceToolName; instruction?: string },
+      ) => callback(call);
+      ipcRenderer.on('cyrvis:voice:tool-call', listener);
+      return () =>
+        ipcRenderer.removeListener('cyrvis:voice:tool-call', listener);
+    },
+    onActivity: (callback: (event: CyrvisActivityEvent) => void) => {
+      const listener = (_event: IpcRendererEvent, event: CyrvisActivityEvent) =>
+        callback(event);
+      ipcRenderer.on('cyrvis:voice:activity', listener);
+      return () =>
+        ipcRenderer.removeListener('cyrvis:voice:activity', listener);
     },
     onResponseStarted: (callback: () => void) => {
       const listener = () => callback();
@@ -234,6 +280,18 @@ const electronHandler = {
       ipcRenderer.on('cyrvis:voice:response-stopped', listener);
       return () =>
         ipcRenderer.removeListener('cyrvis:voice:response-stopped', listener);
+    },
+    onPlaybackPause: (callback: () => void) => {
+      const listener = () => callback();
+      ipcRenderer.on('cyrvis:voice:playback-pause', listener);
+      return () =>
+        ipcRenderer.removeListener('cyrvis:voice:playback-pause', listener);
+    },
+    onPlaybackResume: (callback: () => void) => {
+      const listener = () => callback();
+      ipcRenderer.on('cyrvis:voice:playback-resume', listener);
+      return () =>
+        ipcRenderer.removeListener('cyrvis:voice:playback-resume', listener);
     },
     onThinking: (callback: () => void) => {
       const listener = () => callback();

@@ -1,7 +1,8 @@
 import { Outlet } from 'react-router';
 import { AppSidebar } from '@/renderer/src/components/SideBar/app-sidebar';
 import { SidebarInset, SidebarProvider } from '@renderer/components/ui/sidebar';
-import { CyrvisVoiceBar } from '@renderer/components/CyrvisVoice/CyrvisVoiceBar';
+import { CyrvisVoiceController } from '@renderer/components/CyrvisVoice/CyrvisVoiceController';
+import { CyrvisVoiceStatusIndicator } from '@renderer/components/CyrvisVoice/CyrvisVoiceStatusIndicator';
 
 export function MainLayout() {
   return (
@@ -13,7 +14,8 @@ export function MainLayout() {
       <SidebarInset className="flex-1">
         <Outlet />
       </SidebarInset>
-      <CyrvisVoiceBar />
+      <CyrvisVoiceController />
+      <CyrvisVoiceStatusIndicator />
     </SidebarProvider>
   );
 }

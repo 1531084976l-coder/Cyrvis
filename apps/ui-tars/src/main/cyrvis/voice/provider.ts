@@ -17,6 +17,8 @@ export interface VoiceProviderCallbacks {
   onAudio?: (pcm16: Int16Array) => void;
   onResponseStarted?: () => void;
   onResponseDone?: () => void;
+  /** Renderer confirmed the WAV queue is empty (not just response.done). */
+  onPlaybackIdle?: () => void;
   onUtteranceCommitted?: () => void;
   onError?: (error: Error) => void;
 }
@@ -28,6 +30,7 @@ export interface VoiceProviderCallbacks {
  */
 export interface VoiceProvider {
   connect(): Promise<void>;
+  setContext?(context: string): void;
   sendAudio(pcm16: Int16Array): void;
   sendToolResult(callId: string, output: string): void;
   cancelResponse(): void;
