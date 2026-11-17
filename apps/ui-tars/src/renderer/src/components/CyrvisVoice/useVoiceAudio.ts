@@ -953,7 +953,9 @@ export function useVoiceAudio() {
           clearTimeout(assistantIdleTimerRef.current);
           assistantIdleTimerRef.current = null;
         }
+        const queuedMs = playerRef.current?.queuedMs ?? 0;
         stopPlayback();
+        window.electron.voice.notifyPlaybackStopped({ queuedMs });
       }),
       window.electron.voice.onPlaybackPause(() => {
         playerRef.current?.pause();

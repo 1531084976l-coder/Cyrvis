@@ -88,6 +88,29 @@ describe('SpeakerEchoDetector', () => {
     expect(result.likelyEcho).toBe(false);
   });
 
+  it('keeps near-term references when a long reply is queued ahead', () => {
+    const detector = new SpeakerEchoDetector();
+    // Establishes the capture clock, as the first analyze() in production does.
+    detector.analyze(makeNoise(320, 7), 1000);
+
+    const blocks = Array.from({ length: 10 }, (_, index) =>
+      makeNoise(24000, 100 + index),
+    );
+    // The renderer now schedules ~1s blocks and a long TTS reply can be queued
+    // tens of seconds ahead. Pruning against the newest (future) start time
+    // used to discard the block that is playing right now.
+    blocks.forEach((block, index) => {
+      detector.addReference(block, 1000 * (index + 1));
+    });
+
+    const first = downsample24kTo16k(blocks[0]);
+    const result = detector.analyze(first.slice(7680, 8000), 1500);
+
+    expect(result.referenceActive).toBe(true);
+    expect(result.correlation).toBeGreaterThan(0.95);
+    expect(result.likelyEcho).toBe(true);
+  });
+
   it('does not classify microphone audio as echo while playback is paused', () => {
     const detector = new SpeakerEchoDetector();
     detector.addReference(makeNoise(36000, 31), 1000);

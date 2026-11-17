@@ -32,4 +32,15 @@ describe('speaker echo detection', () => {
   it('does not use stale assistant text', () => {
     expect(isLikelySpeakerEcho('我在的', '我在的', 20_000)).toBe(false);
   });
+
+  it('keeps a wake phrase that starts with the assistant greeting', () => {
+    expect(isLikelySpeakerEcho('Hello, hello, savage.', 'Hello', 100)).toBe(
+      false,
+    );
+    expect(isLikelySpeakerEcho('你好赛维斯', '你好', 100)).toBe(false);
+  });
+
+  it('does not treat a one-word reply as a full echo reference', () => {
+    expect(isLikelySpeakerEcho('你好，我在', '你好', 100)).toBe(false);
+  });
 });

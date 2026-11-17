@@ -79,6 +79,10 @@ def _embedding(pcm: bytes) -> np.ndarray:
     return embedding / norm
 
 
+def _embedding_f32_path() -> Path:
+    return EMBEDDING_PATH.with_suffix(".f32")
+
+
 def _load_embedding() -> np.ndarray | None:
     if not EMBEDDING_PATH.exists():
         return None
@@ -104,10 +108,13 @@ async def enroll(request: Request):
     embedding = _embedding(pcm)
     EMBEDDING_PATH.parent.mkdir(parents=True, exist_ok=True)
     np.save(EMBEDDING_PATH, embedding)
+    # Node/Electron reads a raw float32 file; the .npy stays for Python tools.
+    embedding.astype(np.float32).tofile(_embedding_f32_path())
     return {
         "ok": True,
         "seconds": round(len(pcm) / 2 / SAMPLE_RATE, 2),
         "embedding": str(EMBEDDING_PATH),
+        "embedding_f32": str(_embedding_f32_path()),
     }
 
 
@@ -130,6 +137,8 @@ async def verify(request: Request):
 def reset():
     if EMBEDDING_PATH.exists():
         EMBEDDING_PATH.unlink()
+    if _embedding_f32_path().exists():
+        _embedding_f32_path().unlink()
     return {"ok": True, "enrolled": False}
 
 

@@ -22,8 +22,9 @@ import {
 import { startCaptureService, type CaptureService } from './capture-service';
 import { CyrvisController } from './controller';
 import { ElectronGUIAdapter } from './gui-adapter';
+import { KeywordGate } from './keyword-gate';
 import { voiceMemoryService } from './memory';
-import { SpeakerEchoDetector } from './speaker-barge';
+import { SpeakerEchoDetector, type SpeakerEchoAnalysis } from './speaker-barge';
 import { isLikelySpeakerEcho } from './speaker-echo';
 import { QwenOmniProvider } from './voice/qwen-omni';
 import { VoiceBrain, type VoiceBrainState } from './voice-brain';
@@ -50,6 +51,10 @@ let lastCaptureLogAt = 0;
 //   assistant can still be interrupted while its own audio is playing.
 let audioMode: 'headset' | 'speaker' = 'headset';
 let speakerOutputMode = false;
+// The output device is independent of the voice mode. If playback is routed
+// to Realtek/NVIDIA while the UI still says "headset", the low-energy headset
+// barge must not run: the mic hears the assistant's own speaker output.
+let externalOutput = false;
 let speakerGuardUntil = 0;
 let lastAssistantText = '';
 let lastAssistantAt = 0;
@@ -58,6 +63,16 @@ let testAudioActive = false;
 let pttActive = false;
 // Hands-free by default. PTT remains available as a fallback mode.
 const pttMode = false;
+
+const isExternalOutputLabel = (label: string): boolean => {
+  const lower = label.toLowerCase();
+  if (/cc ultimate|airpods|耳机|headset|bluetooth/.test(lower)) {
+    return false;
+  }
+  return /realtek|nvidia|扬声器|speaker|digital output|hdmi|display/.test(
+    lower,
+  );
+};
 
 const CAPTURE_BARGE_THRESHOLD = 1500;
 const CAPTURE_BARGE_SUSTAIN_MS = 180;
@@ -73,6 +88,16 @@ const SPEAKER_PROBE_THRESHOLD = 1100;
 const SPEAKER_RESUME_SUPPRESS_MS = 550;
 const SPEAKER_DIRECT_PREROLL_CHUNKS = 24;
 const HEADSET_REVERB_GUARD_MS = 900;
+// Fast fallback when KWS misses a very short bare "停": require 300ms of
+// near-end energy, then verify the same 1s window with the local speaker
+// embedding before interrupting. This replaces the old 13s-late direct path.
+const VOICE_FALLBACK_SUSTAIN_MS = 200;
+const VOICE_FALLBACK_THRESHOLD = 1200;
+const VOICE_FALLBACK_COOLDOWN_MS = 700;
+const VOICE_FALLBACK_VOICEPRINT = 0.22;
+const BARGE_SAMPLE_DIR = path.resolve(process.cwd(), '../../doc/kws-lab');
+const BARGE_SAMPLE_MAX_CHUNKS = 150; // 3s at 20ms
+const BARGE_SAMPLE_DUMP_INTERVAL_MS = 3000;
 
 const AUDIO_SCRIPT_CANDIDATES = () => [
   path.resolve(
@@ -155,6 +180,35 @@ let voiceprintResidual: Int16Array[] = [];
 const VOICEPRINT_COOLDOWN_MS = 600;
 let speakerBargeStopPending = false;
 let speakerBargeStopTimer: ReturnType<typeof setTimeout> | null = null;
+interface BargeTrace {
+  responseStartedAt: number;
+  speechOnsetAt: number | null;
+  detectedAt: number | null;
+  verifiedAt: number | null;
+  bargeAt: number | null;
+  keyword?: string;
+  score?: number | null;
+  accepted?: boolean;
+}
+let bargeTrace: BargeTrace | null = null;
+let voiceOnsetAt = 0;
+let bargeSampleBuffer: Int16Array[] = [];
+// Continuous ~1s buffer that is NOT cleared at response start. The normal
+// capturePreroll is cleared so a new response starts clean, which left the
+// first 0.5s with no voiceprint window and produced score=null near-misses.
+let keywordPreroll: Int16Array[] = [];
+// Aligned playback reference for relative user-vs-TTS verification.
+let referencePreroll: Float32Array[] = [];
+let lastBargeDumpAt = 0;
+let keywordGate: KeywordGate | null = null;
+let keywordRejectUntil = 0;
+// Runtime A/B switch (Ctrl+Alt+E): pure 1500/180ms energy barge, including
+// external output. Off = KWS + voiceprint. Started from
+// CYRVIS_EXTERNAL_ENERGY_BARGE for reproducing the 11:00 behavior.
+let energyOnlyBarge = process.env.CYRVIS_EXTERNAL_ENERGY_BARGE === '1';
+let voiceFallbackMs = 0;
+let lastVoiceFallbackAt = 0;
+let lastDeviceChangeRetryAt = 0;
 
 const pushCapturePreroll = (pcm16: Int16Array): void => {
   capturePreroll.push(pcm16.slice());
@@ -165,11 +219,103 @@ const pushCapturePreroll = (pcm16: Int16Array): void => {
   }
 };
 
+const averageAbsoluteInt16 = (samples: Int16Array): number => {
+  if (!samples.length) {
+    return 0;
+  }
+  let total = 0;
+  for (let index = 0; index < samples.length; index += 1) {
+    total += Math.abs(samples[index]);
+  }
+  return total / samples.length / 0x8000;
+};
+
+const writePcm16Wav = (file: string, chunks: Int16Array[]): void => {
+  const dataLength = chunks.reduce((sum, chunk) => sum + chunk.length, 0) * 2;
+  const header = Buffer.alloc(44);
+  header.write('RIFF', 0, 'ascii');
+  header.writeUInt32LE(36 + dataLength, 4);
+  header.write('WAVE', 8, 'ascii');
+  header.write('fmt ', 12, 'ascii');
+  header.writeUInt32LE(16, 16);
+  header.writeUInt16LE(1, 20);
+  header.writeUInt16LE(1, 22);
+  header.writeUInt32LE(16000, 24);
+  header.writeUInt32LE(32000, 28);
+  header.writeUInt16LE(2, 32);
+  header.writeUInt16LE(16, 34);
+  header.write('data', 36, 'ascii');
+  header.writeUInt32LE(dataLength, 40);
+  const data = Buffer.alloc(dataLength);
+  let offset = 0;
+  for (const chunk of chunks) {
+    for (let index = 0; index < chunk.length; index += 1) {
+      data.writeInt16LE(chunk[index], offset);
+      offset += 2;
+    }
+  }
+  fs.writeFileSync(file, Buffer.concat([header, data]));
+};
+
+const dumpBargeFailure = (
+  reason: string,
+  keyword?: string,
+  score?: number | null,
+): void => {
+  if (process.env.CYRVIS_KWS_DUMP_FAILURES !== '1') {
+    return;
+  }
+  const now = Date.now();
+  if (now - lastBargeDumpAt < BARGE_SAMPLE_DUMP_INTERVAL_MS) {
+    return;
+  }
+  lastBargeDumpAt = now;
+  const chunks = bargeSampleBuffer.slice(-BARGE_SAMPLE_MAX_CHUNKS);
+  if (!chunks.length) {
+    return;
+  }
+  try {
+    fs.mkdirSync(BARGE_SAMPLE_DIR, { recursive: true });
+    const stamp = new Date(now).toISOString().replace(/[:.]/g, '-');
+    const file = path.join(BARGE_SAMPLE_DIR, `failed-${stamp}-${reason}.wav`);
+    writePcm16Wav(file, chunks);
+    logger.info('[cyrvis kws] dumped failure sample', {
+      file,
+      reason,
+      keyword: keyword ?? null,
+      score: score ?? null,
+    });
+  } catch (error) {
+    logger.warn('[cyrvis kws] failure sample dump failed', error);
+  }
+};
+
+const recentForVerification = (): Int16Array[] => {
+  const total = capturePreroll.reduce((sum, chunk) => sum + chunk.length, 0);
+  return total >= 8000 ? capturePreroll : keywordPreroll;
+};
+
+const recentReference = (): Float32Array | null => {
+  const total = referencePreroll.reduce((sum, chunk) => sum + chunk.length, 0);
+  if (total < 8000) {
+    return null;
+  }
+  const output = new Float32Array(total);
+  let offset = 0;
+  for (const chunk of referencePreroll) {
+    output.set(chunk, offset);
+    offset += chunk.length;
+  }
+  return output;
+};
+
 const resetSpeakerDetection = (): void => {
   speakerEchoDetector.reset();
   speakerProbe = null;
   speakerCandidateMs = 0;
   headsetBargeMs = 0;
+  voiceFallbackMs = 0;
+  referencePreroll = [];
   speakerResumeSuppressUntil = 0;
   voiceprintResidual = [];
 };
@@ -197,8 +343,8 @@ const finishSpeakerBargeIn = (_buffered: Int16Array[]): void => {
   speakerGuardUntil = 0;
   speakerEchoDetector.reset();
   capturePreroll = [];
-  service.provider.bargeIn();
-  service.provider.muteMicFor(900);
+  service.provider.bargeIn({ forceCommit: false });
+  service.provider.muteMicFor(800);
   service.brain.forceAwake();
   service.brain.handleBargeStop();
   broadcast('cyrvis:voice:response-stopped');
@@ -353,13 +499,30 @@ const handleSpeakerPlaybackPcm = (
   pcm16: Int16Array,
   average: number,
   now: number,
+  analysisOverride: SpeakerEchoAnalysis | null = null,
 ): void => {
   if (speakerProbe) {
     handleSpeakerProbePcm(pcm16, average, now);
     return;
   }
 
-  const analysis = speakerEchoDetector.analyze(pcm16, now);
+  const analysis = analysisOverride ?? speakerEchoDetector.analyze(pcm16, now);
+  const residualAverage = averageAbsoluteInt16(analysis.residual);
+  if (assistantPlaybackActive) {
+    // Echo residual is a much better user-onset proxy than raw energy: the
+    // assistant's own TTS subtracts out, while user speech remains.
+    const nearEnd = residualAverage > 0.015 && average > 1200;
+    if (nearEnd) {
+      if (voiceOnsetAt === 0) {
+        voiceOnsetAt = now;
+      }
+      if (bargeTrace && bargeTrace.speechOnsetAt === null) {
+        bargeTrace.speechOnsetAt = voiceOnsetAt;
+      }
+    } else if (residualAverage < 0.004) {
+      voiceOnsetAt = 0;
+    }
+  }
   voiceprintResidual.push(analysis.residual);
   if (voiceprintResidual.length > 50) {
     voiceprintResidual.shift();
@@ -370,9 +533,19 @@ const handleSpeakerPlaybackPcm = (
       avg: Math.round(average),
       ref: Math.round(analysis.referenceAverage * 0x8000),
       corr: Number(analysis.correlation.toFixed(3)),
+      residual: Number(residualAverage.toFixed(4)),
       echo: analysis.likelyEcho,
       ambiguous: analysis.ambiguous,
     });
+  }
+
+  // The local KWS + voiceprint gate in handleCapturePcm owns all barge
+  // decisions while it is available. The legacy energy/correlation path below
+  // was measured taking up to 13 seconds to fire on the same utterance; keep
+  // it only as a fallback when the KWS model could not be loaded.
+  if (keywordGate?.available) {
+    speakerCandidateMs = 0;
+    return;
   }
 
   if (now < speakerResumeSuppressUntil) {
@@ -394,16 +567,19 @@ const handleSpeakerPlaybackPcm = (
   // Speaker-verification gate: only an enrolled user's voice may interrupt.
   // This is what lets us ignore the assistant's own speaker output even when
   // its energy is higher than the user's voice.
+  // The local KWS gate already performs speaker verification. Do not also
+  // call the optional Python sidecar; when it is not running those requests
+  // just fail noisily on every loud echo frame.
   if (
     voiceprintUrl() &&
+    !keywordGate?.available &&
     !voiceprintPending &&
     now - lastVoiceprintAt >= VOICEPRINT_COOLDOWN_MS
   ) {
     lastVoiceprintAt = now;
     speakerCandidateMs = 0;
     voiceprintPending = true;
-    const fallbackDirect =
-      !analysis.ambiguous && analysis.referenceActive;
+    const fallbackDirect = !analysis.ambiguous && analysis.referenceActive;
     void verifyVoiceprint().then((match) => {
       if (!assistantPlaybackActive) {
         return;
@@ -475,12 +651,150 @@ const handleCapturePcm = (pcm16: Int16Array): void => {
       avg: Math.round(average),
       playing: assistantPlaybackActive,
       mode: audioMode,
+      externalOutput,
     });
   }
 
   pushCapturePreroll(pcm16);
+  keywordPreroll.push(pcm16.slice());
+  if (keywordPreroll.length > 50) {
+    keywordPreroll.shift();
+  }
+  if (assistantPlaybackActive) {
+    bargeSampleBuffer.push(pcm16.slice());
+    if (bargeSampleBuffer.length > BARGE_SAMPLE_MAX_CHUNKS) {
+      bargeSampleBuffer.shift();
+    }
+  }
 
-  if (assistantPlaybackActive && !speakerOutputMode) {
+  // Stop words are detected on the raw microphone signal, not on AEC output.
+  // In the real double-talk sample, AEC3 removed the near-end "停一下" while
+  // the raw signal kept it; a speaker-embedding gate then rejects the
+  // assistant's own TTS saying "暂停". See doc/speaker-barge-solution.md.
+  // Comparison switch: when on, both headset and external output use the
+  // 11:00 1500/180ms energy path. When off, speaker output uses KWS +
+  // voiceprint and headset output keeps its own energy path.
+  const externalEnergyBarge = energyOnlyBarge;
+  const speakerPath =
+    (speakerOutputMode || externalOutput) && !externalEnergyBarge;
+  // Headset/energy-only paths use raw energy for onset trace. Speaker mode
+  // uses the echo-residual onset below, otherwise the assistant's own TTS
+  // start looks like the user's speech onset and inflates the trace.
+  if (assistantPlaybackActive && !speakerPath) {
+    if (average > 1800) {
+      if (voiceOnsetAt === 0) {
+        voiceOnsetAt = now;
+      }
+      if (bargeTrace && bargeTrace.speechOnsetAt === null) {
+        bargeTrace.speechOnsetAt = voiceOnsetAt;
+      }
+    } else if (average < 600) {
+      voiceOnsetAt = 0;
+    }
+  }
+  let speakerAnalysis: SpeakerEchoAnalysis | null = null;
+  if (assistantPlaybackActive && speakerPath) {
+    speakerAnalysis = speakerEchoDetector.analyze(pcm16, now);
+    if (speakerAnalysis.reference) {
+      referencePreroll.push(speakerAnalysis.reference);
+      if (referencePreroll.length > 50) {
+        referencePreroll.shift();
+      }
+    }
+  }
+  const ttsContainsStop = /停|暂停|停止/.test(lastAssistantText);
+  if (assistantPlaybackActive && keywordGate && !externalEnergyBarge) {
+    const keywordResult = keywordGate.feed(
+      pcm16,
+      recentForVerification(),
+      speakerPath,
+      {
+        ttsContainsStop,
+        reference: speakerAnalysis?.referenceActive ? recentReference() : null,
+      },
+    );
+    if (keywordResult === 'triggered') {
+      return;
+    }
+    if (keywordResult === 'rejected') {
+      // This hit was the assistant's own voice (or not the enrolled user).
+      // Do not let the legacy energy path turn the same echo into a barge.
+      keywordRejectUntil = now + 600;
+      speakerCandidateMs = 0;
+      return;
+    }
+  }
+  if (
+    assistantPlaybackActive &&
+    !externalEnergyBarge &&
+    now < keywordRejectUntil
+  ) {
+    return;
+  }
+
+  // Fast fallback for a bare "停" that KWS misses: 300ms of near-end energy,
+  // then the same local speaker embedding over the last 1s. This is much
+  // faster than the legacy correlation path and never fires on the assistant's
+  // own TTS (its embedding score is ~0.1).
+  if (assistantPlaybackActive && speakerPath && keywordGate?.available) {
+    const chunkMs = (pcm16.length / 16000) * 1000;
+    if (average > VOICE_FALLBACK_THRESHOLD) {
+      voiceFallbackMs += chunkMs;
+    } else {
+      voiceFallbackMs = 0;
+    }
+    if (
+      voiceFallbackMs >= VOICE_FALLBACK_SUSTAIN_MS &&
+      now - lastVoiceFallbackAt >= VOICE_FALLBACK_COOLDOWN_MS
+    ) {
+      lastVoiceFallbackAt = now;
+      voiceFallbackMs = 0;
+      const recent = recentForVerification();
+      const reference = speakerAnalysis?.referenceActive
+        ? recentReference()
+        : null;
+      const score = keywordGate.verify(recent);
+      const relative = keywordGate.verifyRelative(recent, reference);
+      const relativeAccepted =
+        relative !== null &&
+        relative.margin > 0.05 &&
+        relative.userScore > 0.04;
+      const relativeAvailable = reference !== null && relative !== null;
+      const fallbackThreshold = ttsContainsStop
+        ? VOICE_FALLBACK_VOICEPRINT
+        : 0.085;
+      // Any-speech barge only uses the relative decision. Absolute scores
+      // overlap with TTS echo and produced false interruptions (margin -0.33
+      // but score 0.09). Wait for the ~1s reference before allowing this path.
+      const accepted = relativeAvailable && relativeAccepted;
+      logger.info('[cyrvis kws] energy fallback check', {
+        score: score === null ? null : Number(score.toFixed(4)),
+        relativeUser:
+          relative === null ? null : Number(relative.userScore.toFixed(4)),
+        relativeTts:
+          relative === null ? null : Number(relative.referenceScore.toFixed(4)),
+        relativeMargin:
+          relative === null ? null : Number(relative.margin.toFixed(4)),
+        relativeAvailable,
+        accepted,
+        avg: Math.round(average),
+        ttsContainsStop,
+        threshold: fallbackThreshold,
+      });
+      if (accepted) {
+        logger.info('[cyrvis kws] energy+voiceprint barge', {
+          relative: relativeAccepted,
+        });
+        triggerBargeIn();
+        return;
+      }
+      dumpBargeFailure('fallback-rejected', undefined, score);
+    }
+  }
+
+  if (assistantPlaybackActive && !speakerPath) {
+    // Headset-routed playback, or the explicit 11:00 comparison mode where
+    // external output is also allowed to use the fast energy path.
     const chunkMs = (pcm16.length / 16000) * 1000;
     if (average > CAPTURE_BARGE_THRESHOLD) {
       headsetBargeMs += chunkMs;
@@ -490,13 +804,13 @@ const handleCapturePcm = (pcm16: Int16Array): void => {
     if (headsetBargeMs >= CAPTURE_BARGE_SUSTAIN_MS) {
       logger.info('[cyrvis capture] barge-in', {
         avg: Math.round(average),
-        mode: 'headset',
+        mode: externalEnergyBarge ? 'energy-only' : 'headset',
       });
       headsetBargeMs = 0;
       assistantPlaybackActive = false;
       capturePreroll = [];
-      service.provider.bargeIn();
-      service.provider.muteMicFor(900);
+      service.provider.bargeIn({ forceCommit: false });
+      service.provider.muteMicFor(800);
       service.brain.forceAwake();
       service.brain.handleBargeStop();
       broadcast('cyrvis:voice:response-stopped');
@@ -505,9 +819,9 @@ const handleCapturePcm = (pcm16: Int16Array): void => {
   }
 
   if (assistantPlaybackActive) {
-    // Speaker mode: reference-aware gating; ambiguous echo is ignored rather
-    // than pausing playback for a probe.
-    handleSpeakerPlaybackPcm(pcm16, average, now);
+    // External output (even if the UI still reports "headset"): use the
+    // reference-aware path so the assistant does not interrupt itself.
+    handleSpeakerPlaybackPcm(pcm16, average, now, speakerAnalysis);
     return;
   }
 
@@ -532,14 +846,17 @@ const clearCaptureRetry = () => {
 };
 
 const scheduleCaptureRetry = (message: string) => {
-  if (captureRetryTimer || captureRetryAttempts >= 3) {
+  // Bluetooth headsets sleep and temporarily disappear from Chromium's device
+  // list. Keep trying long enough for the user to power the headset back on
+  // instead of requiring an app restart.
+  if (captureRetryTimer || captureRetryAttempts >= 1000) {
     return;
   }
   if (!/No physical microphone|Microphone disconnected/i.test(message)) {
     return;
   }
   captureRetryAttempts += 1;
-  const delay = 1200;
+  const delay = Math.min(5000, 1000 + captureRetryAttempts * 400);
   logger.warn('[cyrvis capture] retrying', {
     attempt: captureRetryAttempts,
     delay,
@@ -593,6 +910,21 @@ const startCapture = async (resetRetries = false): Promise<void> => {
           broadcast('cyrvis:voice:capture-error', { message });
           emitActivity('error', `麦克风连接失败：${message}`);
           scheduleCaptureRetry(message);
+        },
+        onDeviceChange: () => {
+          if (generation !== captureGeneration || captureReady) {
+            return;
+          }
+          const now = Date.now();
+          if (now - lastDeviceChangeRetryAt < 3000) {
+            return;
+          }
+          lastDeviceChangeRetryAt = now;
+          // A Bluetooth headset just came back. Reset the retry budget so a
+          // device that was powered off for a while still reconnects.
+          captureRetryAttempts = 0;
+          clearCaptureRetry();
+          scheduleCaptureRetry('Microphone disconnected');
         },
       },
       // The capture renderer has no reference signal from the playback
@@ -662,14 +994,19 @@ const triggerBargeIn = () => {
     return;
   }
   logger.info('[cyrvis voice] barge-in');
+  if (bargeTrace) {
+    bargeTrace.bargeAt = Date.now();
+  }
   const wasPlaying = assistantPlaybackActive;
   expectSpeakerBargeStop();
   assistantPlaybackActive = false;
   capturePreroll = [];
+  keywordRejectUntil = 0;
+  keywordGate?.reset();
   resetSpeakerDetection();
-  service.provider.bargeIn();
+  service.provider.bargeIn({ forceCommit: false });
   if (wasPlaying) {
-    service.provider.muteMicFor(900);
+    service.provider.muteMicFor(800);
   }
   service.brain.forceAwake();
   service.brain.handleBargeStop();
@@ -862,6 +1199,8 @@ const registerVoiceIpc = () => {
     if (speakerProbe) {
       broadcast('cyrvis:voice:playback-resume');
     }
+    keywordRejectUntil = 0;
+    keywordGate?.reset();
     resetSpeakerDetection();
     logger.info('[cyrvis voice] audio mode', {
       mode: audioMode,
@@ -891,8 +1230,15 @@ const registerVoiceIpc = () => {
     if (speakerProbe) {
       broadcast('cyrvis:voice:playback-resume');
     }
+    externalOutput = isExternalOutputLabel(label);
+    keywordRejectUntil = 0;
+    keywordGate?.reset();
     resetSpeakerDetection();
-    logger.info('[cyrvis voice] output label', { label, mode: audioMode });
+    logger.info('[cyrvis voice] output label', {
+      label,
+      mode: audioMode,
+      externalOutput,
+    });
     broadcast('cyrvis:voice:set-output', label);
     return { ok: true, mode: audioMode, speaker: speakerOutputMode };
   });
@@ -910,6 +1256,39 @@ const registerVoiceIpc = () => {
     }
   });
 
+  ipcMain.on(
+    'cyrvis:voice:playback-stopped',
+    (_event, info?: { queuedMs?: number }) => {
+      const trace = bargeTrace;
+      const stoppedAt = Date.now();
+      if (trace?.bargeAt) {
+        logger.info('[cyrvis barge trace]', {
+          keyword: trace.keyword ?? null,
+          score: trace.score ?? null,
+          accepted: trace.accepted ?? null,
+          onsetToDetect:
+            trace.speechOnsetAt && trace.detectedAt
+              ? trace.detectedAt - trace.speechOnsetAt
+              : null,
+          detectToVerify:
+            trace.detectedAt && trace.verifiedAt
+              ? trace.verifiedAt - trace.detectedAt
+              : null,
+          detectToBarge: trace.detectedAt
+            ? trace.bargeAt - trace.detectedAt
+            : null,
+          bargeToStop: stoppedAt - trace.bargeAt,
+          onsetToStop: trace.speechOnsetAt
+            ? stoppedAt - trace.speechOnsetAt
+            : null,
+          responseToStop: stoppedAt - trace.responseStartedAt,
+          queuedMs: info?.queuedMs ?? null,
+        });
+      }
+      bargeTrace = null;
+    },
+  );
+
   ipcMain.on('cyrvis:voice:playback-idle', () => {
     const bargeStopPending = speakerBargeStopPending;
     speakerBargeStopPending = false;
@@ -918,6 +1297,8 @@ const registerVoiceIpc = () => {
       speakerBargeStopTimer = null;
     }
     assistantPlaybackActive = false;
+    keywordRejectUntil = 0;
+    keywordGate?.reset();
     resetSpeakerDetection();
     speakerGuardUntil = !bargeStopPending
       ? Date.now() +
@@ -1061,7 +1442,19 @@ export const startVoiceService = (): VoiceService | null => {
             speakerBargeStopTimer = null;
           }
           resetSpeakerDetection();
+          keywordRejectUntil = 0;
+          keywordGate?.reset();
           assistantPlaybackActive = true;
+          bargeTrace = {
+            responseStartedAt: Date.now(),
+            speechOnsetAt: null,
+            detectedAt: null,
+            verifiedAt: null,
+            bargeAt: null,
+          };
+          voiceOnsetAt = 0;
+          bargeSampleBuffer = [];
+          referencePreroll = [];
           capturePreroll = [];
           speakerGuardUntil = 0;
           lastAssistantText = '';
@@ -1156,6 +1549,33 @@ export const startVoiceService = (): VoiceService | null => {
 
   service = { brain, provider, controller };
 
+  // Load the local stop-word models before capture starts. If a model is
+  // missing the voice service still works; only the keyword fast-path is off.
+  keywordGate = new KeywordGate({
+    onTrigger: (keyword) => {
+      logger.info('[cyrvis voice] keyword barge-in', { keyword });
+      triggerBargeIn();
+    },
+    onDetected: (keyword, at) => {
+      if (bargeTrace) {
+        bargeTrace.keyword = keyword;
+        bargeTrace.detectedAt = at;
+      }
+    },
+    onVerified: (keyword, score, accepted, at) => {
+      if (bargeTrace) {
+        bargeTrace.keyword = keyword;
+        bargeTrace.score = score;
+        bargeTrace.accepted = accepted;
+        bargeTrace.verifiedAt = at;
+      }
+    },
+    onReject: (keyword, score) => {
+      dumpBargeFailure('kws-rejected', keyword, score);
+    },
+  });
+  keywordGate.load();
+
   if (pttMode) {
     const shortcutRegistered = globalShortcut.register(
       'Control+Alt+Space',
@@ -1175,10 +1595,30 @@ export const startVoiceService = (): VoiceService | null => {
     registered: stopShortcut,
   });
 
+  // A/B switch for the 11:00 energy behavior. No restart needed.
+  const energyShortcut = globalShortcut.register('Control+Alt+E', () => {
+    energyOnlyBarge = !energyOnlyBarge;
+    resetSpeakerDetection();
+    keywordGate?.reset();
+    logger.info('[cyrvis voice] energy-only barge toggled', {
+      enabled: energyOnlyBarge,
+    });
+    emitActivity(
+      'speech',
+      energyOnlyBarge ? '纯能量打断：开' : 'KWS + 声纹打断：开',
+    );
+  });
+  logger.info('[cyrvis voice] energy-only barge shortcut', {
+    accelerator: 'Control+Alt+E',
+    enabled: energyOnlyBarge,
+    registered: energyShortcut,
+  });
+
   app.on('before-quit', () => {
     globalShortcut.unregisterAll();
     captureService?.close();
     captureService = null;
+    keywordGate = null;
     brain.dispose();
     service = null;
   });

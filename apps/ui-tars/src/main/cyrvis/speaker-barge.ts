@@ -24,6 +24,8 @@ export interface SpeakerEchoAnalysis {
   ambiguous: boolean;
   /** Microphone audio after subtracting the best-aligned playback reference. */
   residual: Int16Array;
+  /** Best-aligned playback reference (16 kHz), used for relative voiceprint. */
+  reference: Float32Array | null;
 }
 
 const toFloat = (input: Int16Array): Float32Array => {
@@ -106,6 +108,12 @@ const correlation = (
 export class SpeakerEchoDetector {
   private references: ReferenceSegment[] = [];
   private referenceEnabled = true;
+  // Wall-clock time of the most recent analyze() call. Playback segments can
+  // be scheduled far in the future (a long TTS reply is queued ahead in 1s
+  // blocks), so pruning must be relative to the current capture clock, not to
+  // the newest segment's start time: pruning against a future start time
+  // dropped every near-term reference as soon as the queue was scheduled.
+  private clock = 0;
 
   addReference(pcm24k: Int16Array, startedAt = Date.now()): void {
     if (!pcm24k.length) {
@@ -115,7 +123,9 @@ export class SpeakerEchoDetector {
       samples: resample24kTo16k(toFloat(pcm24k.slice())),
       startedAt,
     });
-    this.prune(startedAt);
+    if (this.clock > 0) {
+      this.prune(this.clock);
+    }
   }
 
   setReferenceEnabled(enabled: boolean): void {
@@ -128,6 +138,9 @@ export class SpeakerEchoDetector {
   }
 
   analyze(microphone16k: Int16Array, now = Date.now()): SpeakerEchoAnalysis {
+    if (now > this.clock) {
+      this.clock = now;
+    }
     const microphone = toFloat(microphone16k);
     const average = averageAbsolute(microphone);
     if (!this.referenceEnabled || microphone.length === 0) {
@@ -139,6 +152,7 @@ export class SpeakerEchoDetector {
         likelyEcho: false,
         ambiguous: false,
         residual: microphone16k.slice(),
+        reference: null,
       };
     }
 
@@ -148,6 +162,11 @@ export class SpeakerEchoDetector {
     let bestReference: Float32Array | null = null;
 
     for (const segment of this.references) {
+      // Segments queued ahead of the current playback position cannot explain
+      // what the microphone is hearing yet.
+      if (segment.startedAt > now) {
+        continue;
+      }
       for (
         let delayMs = 0;
         delayMs <= MAX_ECHO_DELAY_MS;
@@ -215,6 +234,7 @@ export class SpeakerEchoDetector {
         bestCorrelation >= AMBIGUOUS_CORRELATION &&
         bestCorrelation < ECHO_CORRELATION,
       residual,
+      reference: bestReference,
     };
   }
 

@@ -4,6 +4,11 @@ const normalize = (text: string): string =>
     .replace(/[\s，。！？、,.!?;；:："'“”‘’]/g, '')
     .trim();
 
+// ASR often hears "CYRVIS" as service/savage/S voice. These are wake attempts,
+// not speaker leakage, even when they start with the assistant's "Hello".
+const WAKE_HINT =
+  /cyrvis|cyrus|cyris|savis|savage|service|svoice|s voice|赛维斯|萨维斯|瑟维斯|塞维斯/i;
+
 const bigrams = (text: string): Set<string> => {
   const result = new Set<string>();
   if (text.length < 2) {
@@ -51,19 +56,25 @@ export const isLikelySpeakerEcho = (
   if (heard.length < 2 || spoken.length < 2) {
     return false;
   }
+  if (WAKE_HINT.test(heard)) {
+    return false;
+  }
   if (heard === spoken) {
     return true;
   }
 
   const short = heard.length <= spoken.length ? heard : spoken;
   const long = heard.length > spoken.length ? heard : spoken;
-  if (short.length >= 3 && long.startsWith(short)) {
+  // A one-word assistant fragment such as "Hello" is too weak to judge: the
+  // user's wake phrase also starts with "Hello". Only match prefixes/suffixes
+  // once the assistant actually said a full phrase.
+  if (spoken.length >= 8 && short.length >= 3 && long.startsWith(short)) {
     return true;
   }
   // Echo recognition often returns only a short suffix of the assistant's
   // sentence. If that complete fragment is present in the just-spoken reply,
   // treat it as leakage instead of starting a new conversational turn.
-  if (short.length >= 3 && long.includes(short)) {
+  if (spoken.length >= 8 && short.length >= 3 && long.includes(short)) {
     return true;
   }
 

@@ -156,3 +156,24 @@
 - [x] 声纹原型：本地 sherpa-onnx ERes2Net（38MB，D 盘），`voiceprint-server` 提供 `/enroll` `/verify`；用户录入 8s + 5s 自检 score 0.7446，TTS 原始音频对用户声纹仅 0.114/0.170，阈值 0.55 区分良好。
 - [x] App 外放打断接入声纹：播放中候选能量达到阈值时，先 POST 最近 ~1s PCM 到 `127.0.0.1:8100/verify`；匹配用户才 `finishSpeakerBargeIn`，不匹配则继续播放；服务不可用时回退旧逻辑。
 - [x] 声纹拒绝用户“停”的根因：播放中麦克风信号被助手回声主导，声纹分数只有 0.02–0.28；干净 TTS 对用户声纹 0.11–0.17，用户自检 0.74。已加单抽头回声减法：SpeakerEchoDetector 按最佳延迟/增益从麦克风 20ms 块中减去播放参考，voiceprint 改用残差缓冲。离线混合测试：混音 score 0.19–0.29（拒绝），减去回声后残差 score 0.72（通过）。
+- [x] 真实双讲录音：`record_doubletalk.py` 改为单实例/超时/按墙钟录音，避免两个进程抢蓝牙麦卡死；录制 13.6s（TTS 1.2–9.4s，用户重复“停一下/别说了”）。
+- [x] AEC 路线修正：真实双讲中 AEC3 默认把用户人声当回声（2.0–3.0s ERLE 33.6dB，原始声纹 0.594 → AEC 0.114），KWS 在 AEC 输出上少检/漏检；停词路径改为 **原始麦克风 + 本地 KWS + 声纹门控**，AEC 仅留作后续 ASR 实验。
+- [x] 本地 KWS 接入：`sherpa-onnx-node@2.0.1` + 中文 zipformer 3.3M；`keyword-gate.ts` 在播放中每 20ms 送入原始 PCM，命中“停/停一下/停一停/别说了/不要说了/赛维斯停止”后取最近 ~1s 做 ERes2Net 声纹校验，阈值 0.35；通过才 `triggerBargeIn()`，拒绝则抑制旧能量路径 600ms。
+- [x] 声纹自回声验证：Huihui TTS “好的，已暂停当前任务，要停止吗？” KWS 命中 2 次“停”，声纹 0.106/0.123 被拒绝；用户真实双讲命中窗口 0.39–0.59 被接受。新增 `keyword-gate.test.ts` 3 个真实音频测试，全部通过。
+- [x] 采集恢复：Chromium 在蓝牙耳机休眠时只暴露 ToDesk 虚拟麦；采集选择允许 `default`/`communications` 别名（仍排除 ToDesk/虚拟/Line-in），隐藏窗格上报设备列表；失败重试从 3 次延长到 20 次，并监听 `devicechange`，耳机重新上电后可自动恢复。
+- [x] 修复“UI 耳机 + 输出 Realtek”自打断：新增 `externalOutput` 状态，由渲染端 `set-output` 标签推断；实际外放时强制走 speaker/声纹路径，禁用 1500/180ms 耳机能量 barge。日志 `level` 现在同时打印 `externalOutput`，便于现场判断。
+- [x] 真机外放 KWS 打断成功（11:34:26）：`detected '别说了'` → `voiceprint gate score 0.2931 / threshold 0.2 accepted:true` → `keyword barge-in`，命中到打断 24ms；旧阈值 0.35 会拒绝该分数。
+- [x] 11:00 行为复刻与 A/B：新增运行时开关 `Ctrl+Alt+E`，在“纯能量 1500/180ms”和“KWS+声纹”之间切换；`CYRVIS_EXTERNAL_ENERGY_BARGE=1` 控制启动默认值。纯能量模式日志为 `barge-in { mode: 'energy-only' }`，KWS 模式为 `detected → voiceprint gate → keyword barge-in`。采集重试上限从 20 次提高到 1000 次（约 80 分钟），避免蓝牙耳机休眠期间重试耗尽。
+- [x] 外放纯能量 A/B 完成：11:55 speaker 模式 energy-only 在助手 “Hello” 播放时连续自打断（avg 2693/4310/1956）；确认 11:00 的可用组合是 headset 模式 + Realtek 输出。默认 `CYRVIS_EXTERNAL_ENERGY_BARGE=0`，`Ctrl+Alt+E` 可现场切换对比。
+- [x] 双级打断：强关键词（赛维斯停止/停一下/停一停/别说了/不要说了）直接停，弱关键词（停/停下/停住/停啊/停了）走声纹 0.25/0.10；新增强词 TTS 自回声测试。
+- [x] 完整 barge trace：onset→detected→verified→barge→renderer stop，渲染端回传 queuedMs；日志 `[cyrvis barge trace]`。
+- [x] 失败样本落盘：`CYRVIS_KWS_DUMP_FAILURES=1` 时写 `doc/kws-lab/failed-*.wav`，供离线 KWS 扫参。
+- [x] 基线扫参完成：threshold 0.1 + trailing blanks 1 保留真实双讲 3 个停词（0.527/0.350/0.450）；0.2 丢弱“停”，blanks=2 延迟 0.3s 且丢弱“停”；TTS 强词自回声声纹仅 0.039/0.117。
+- [x] 采集稳定性修复：隐藏采集窗改为单次 `getUserMedia` 并复用；仅当默认设备是 ToDesk 虚拟麦时才 stop 并重开物理设备。90 秒测试 0 断连、0 采集错误；外放模式切换后采集重启仍稳定。3 分钟 sounddevice 长录也稳定（178.35s/180s）。
+- [x] 修复“喊好几次才停”的两个近失：新增连续 `keywordPreroll`（不随 response start 清空），解决冷启动 score=null；非停词语境能量兜底阈值 0.1→0.085（真机 TTS 回声本轮最高 0.0754，用户近失 0.0998）。
+- [x] 停后新指令响应优化：barge 后 muted 1500→800ms，ASR 静默 2500→1000ms，回复抑制 3.5→3.0s；真实新指令（长度≥3、非纯数字）到达时立即清除抑制，回声数字不会。
+- [x] 恢复 Chromium AGC（降噪仍关闭）：真机日志显示正常音量“停”到不了阈值，只有 avg 6241/8144 的大声“停了”才命中；AGC 用于提升入耳麦正常说话电平。
+- [x] 提高单字“停”首次成功率：KWS threshold 0.1→0.05；`ttsContainsStop=false` 时弱词也直接打断（不再等声纹），`ttsContainsStop=true` 时才要求 0.25 声纹。真机 00:10:13 的“停”score 0.2681、bargeToStop 2ms，但此前多次尝试未被 KWS 检出。
+- [x] 相对声纹外放打断：`SpeakerEchoDetector` 返回对齐 TTS 参考，主进程维护 1s referencePreroll；能量兜底 200ms/1200，margin>0.05 即打断；离线双讲用户 margin +0.2~+0.58，TTS 回声 -0.09~-0.13；新增 `prefers the enrolled user over the TTS reference` 测试。
+- [x] 修复长回复相对声纹失效：`webaudio-player` 不再把整段队列塞进一个 AudioBuffer，改为 1s 分块独立 `startedAt`/`onSegmentStart`；`SpeakerEchoDetector` 改用采集时钟 prune，保留未来已排队参考、只淘汰播放超过 5s 的段，并跳过未开始的段；新增长回复排队单测。
+- [x] 真机外放复测“任意说话”：修复后长回复 `relativeAvailable` 持续为 true；00:29:02 / 00:29:25 / 00:30:11 三次相对声纹（margin +0.33 / +0.066 / +0.106）成功打断，回声检查（-0.45 ~ +0.025）全部拒绝。连续大声 TTS 时仍以 KWS 停词为快速路径。

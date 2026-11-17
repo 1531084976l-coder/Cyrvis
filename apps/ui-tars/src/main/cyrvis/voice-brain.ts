@@ -45,7 +45,7 @@ export interface VoiceBrainOptions {
 
 const DEFAULT_WAKE_PATTERNS: RegExp[] = [
   /\b(hello|hallo|hi|hey|ok)[\s,，]*(cyrvis|cyrus|cyris|cyprus|cypres|cypress|cybris|sirvis|cervis|sirius|siris|service|zawis|zavis|savis|cywiz|cy vis)\b/i,
-  /\b(cyrvis|cyrus|cyris|cyprus|cypres|cypress|cybris|zawis|zavis|savis)\b/i,
+  /\b(cyrvis|cyrus|cyris|cyprus|cypres|cypress|cybris|zawis|zavis|savis|savage|savages|s voice|svoice)\b/i,
   /\b(hello|hallo|hi|hey)\b/i,
   /(你好|您好|嗨|哈喽|哈啰|哈罗)/,
   /(你好|您好|嗨|喂|哈喽|哈啰|哈罗)[，,\s]*(cyrvis|赛维斯|瑟维斯|瑟尔维斯|赛勒斯|塞勒斯|赛鲁斯|塞浦路斯|塞维斯)/i,
@@ -192,7 +192,10 @@ export class VoiceBrain {
    * a short window so it cannot answer with "好的，已暂停…".
    */
   markUserStop(): void {
-    this.suppressReplyUntil = Date.now() + 2000;
+    // Qwen can start a follow-up response 2-3s after the barge audio was
+    // cancelled. 3s covers the observed 2.3s follow-up while still allowing
+    // a real new command to clear the window immediately.
+    this.suppressReplyUntil = Date.now() + 3000;
   }
 
   /**
@@ -393,6 +396,17 @@ export class VoiceBrain {
       // The tool-result response is the single acknowledgment. Suppress the
       // proactive "已暂停/已停止" line that would otherwise race it.
       this.suppressControlProactivityUntil = Date.now() + 5000;
+    }
+
+    // After a stop, a real new command should not be delayed by the 3s
+    // anti-acknowledgment window. Numeric/short fragments are usually TTS
+    // echo or noise, so they do not clear it.
+    if (this.shouldSuppressReply() && !bareStop) {
+      const trimmed = text.trim();
+      if (trimmed.length >= 3 && !/^\d+$/.test(trimmed)) {
+        this.suppressReplyUntil = 0;
+        console.log('[cyrvis voice] new command after stop; allowing reply');
+      }
     }
 
     if (!this.awake) {

@@ -304,18 +304,22 @@ export class QwenOmniProvider implements VoiceProvider {
    * further audio from it, and reopens the microphone immediately so the
    * interruption itself can be transcribed.
    */
-  bargeIn(): void {
+  bargeIn(options: { forceCommit?: boolean } = {}): void {
     console.log('[cyrvis provider] barge-in');
     this.suppressAudio = true;
     this.responseAudioBytes = 0;
     // A single-syllable "停" can be under the normal 300 ms speech minimum.
-    // The renderer already confirmed real voice energy, so accept this
-    // utterance even if it is short.
-    this.forceNextCommit = true;
+    // When the caller only has energy/ASR evidence, accept the short utterance
+    // so it can be transcribed. KWS-confirmed barges do not need this: forcing
+    // a commit made Qwen answer the stop word with "好的，有什么需要我帮忙的
+    // 吗？" immediately after the stop.
+    this.forceNextCommit = options.forceCommit ?? true;
     this.cancelResponse();
     this.micMuteUntil = 0;
     this.clearAudioBuffer();
-    this.postBargeSilenceMs = 1600;
+    // Keep the mic closed longer than the old 1.6s so the TTS tail cannot be
+    // committed as a new user utterance and trigger a fresh response.
+    this.postBargeSilenceMs = 1000;
   }
 
   /** Hard stop: keep the mic closed while the TTS tail decays. */

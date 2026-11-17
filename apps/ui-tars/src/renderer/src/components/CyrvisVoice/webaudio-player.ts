@@ -47,9 +47,20 @@ export class WebAudioStreamPlayer {
   }
 
   get isActive(): boolean {
-    return (
-      this.pendingSamples > 0 || this.sources.size > 0 || this.started
+    return this.pendingSamples > 0 || this.sources.size > 0 || this.started;
+  }
+
+  /** Approximate audio still waiting to reach the speaker. */
+  get queuedMs(): number {
+    const pendingMs = (this.pendingSamples / SAMPLE_RATE) * 1000;
+    if (!this.context || this.nextStartTime === 0) {
+      return pendingMs;
+    }
+    const scheduledMs = Math.max(
+      0,
+      (this.nextStartTime - this.context.currentTime) * 1000,
     );
+    return Math.max(pendingMs, scheduledMs);
   }
 
   play(pcm16: Int16Array): void {
@@ -61,10 +72,7 @@ export class WebAudioStreamPlayer {
     this.started = true;
 
     const bufferedSeconds = this.pendingSamples / SAMPLE_RATE;
-    if (
-      bufferedSeconds >= INITIAL_BUFFER_SECONDS ||
-      this.nextStartTime > 0
-    ) {
+    if (bufferedSeconds >= INITIAL_BUFFER_SECONDS || this.nextStartTime > 0) {
       void this.pump();
     }
   }
@@ -88,7 +96,10 @@ export class WebAudioStreamPlayer {
       return;
     }
     this.paused = false;
-    void this.context?.resume().then(() => this.pump()).catch(() => undefined);
+    void this.context
+      ?.resume()
+      .then(() => this.pump())
+      .catch(() => undefined);
   }
 
   stop(notifyIdle = true): void {
@@ -157,7 +168,7 @@ export class WebAudioStreamPlayer {
   }
 
   private async pump(): Promise<void> {
-    if (this.paused || this.finished && this.pendingSamples === 0) {
+    if (this.paused || (this.finished && this.pendingSamples === 0)) {
       this.maybeIdle();
       return;
     }
@@ -170,52 +181,78 @@ export class WebAudioStreamPlayer {
       return;
     }
 
-    // Schedule all currently buffered PCM as one contiguous block. AudioBuffer
-    // is created at 24kHz and the context resamples to its native rate.
-    const samples = new Int16Array(this.pendingSamples);
-    let offset = 0;
-    for (const chunk of this.pending) {
-      samples.set(chunk, offset);
-      offset += chunk.length;
-    }
+    // Schedule the queue in bounded 1s blocks. A single 50s AudioBuffer has
+    // only one startedAt, so the main-process echo detector could not align
+    // the current playback reference and relative voiceprint disabled itself.
+    const pending = this.pending;
+    const total = this.pendingSamples;
     this.pending = [];
     this.pendingSamples = 0;
 
-    const buffer = context.createBuffer(1, samples.length, SAMPLE_RATE);
-    const channel = buffer.getChannelData(0);
-    for (let i = 0; i < samples.length; i += 1) {
-      channel[i] = samples[i] / 0x8000;
-    }
-
-    const source = context.createBufferSource();
-    source.buffer = buffer;
-    source.connect(this.gain!);
     const now = context.currentTime;
-    const startAt = Math.max(now + START_LEAD_SECONDS, this.nextStartTime);
     if (now > this.nextStartTime && this.nextStartTime > 0) {
       console.warn('[cyrvis] audio underrun', {
         gapMs: Math.round((now - this.nextStartTime) * 1000),
       });
     }
-    this.nextStartTime = startAt + buffer.duration;
+    let startAt = Math.max(now + START_LEAD_SECONDS, this.nextStartTime);
+    let chunkIndex = 0;
+    let chunkOffset = 0;
+    let scheduled = 0;
+    const maxBlockSamples = SAMPLE_RATE; // 1s
 
-    const startedAt = Date.now() + (startAt - now) * 1000;
-    this.onSegmentStart?.(samples, startedAt);
-
-    this.sources.add(source);
-    source.onended = () => {
-      this.sources.delete(source);
-      source.disconnect();
-      if (this.finished && this.pendingSamples === 0 && this.sources.size === 0) {
-        this.maybeIdle();
+    while (scheduled < total) {
+      const size = Math.min(maxBlockSamples, total - scheduled);
+      const samples = new Int16Array(size);
+      let filled = 0;
+      while (filled < size) {
+        const chunk = pending[chunkIndex];
+        const take = Math.min(chunk.length - chunkOffset, size - filled);
+        samples.set(chunk.subarray(chunkOffset, chunkOffset + take), filled);
+        filled += take;
+        chunkOffset += take;
+        if (chunkOffset >= chunk.length) {
+          chunkIndex += 1;
+          chunkOffset = 0;
+        }
       }
-    };
 
-    try {
-      source.start(startAt);
-    } catch (error) {
-      this.sources.delete(source);
-      this.onError(error);
+      const buffer = context.createBuffer(1, samples.length, SAMPLE_RATE);
+      const channel = buffer.getChannelData(0);
+      for (let i = 0; i < samples.length; i += 1) {
+        channel[i] = samples[i] / 0x8000;
+      }
+
+      const source = context.createBufferSource();
+      source.buffer = buffer;
+      source.connect(this.gain!);
+      const startedAt = Date.now() + (startAt - context.currentTime) * 1000;
+      this.onSegmentStart?.(samples, startedAt);
+
+      this.sources.add(source);
+      source.onended = () => {
+        this.sources.delete(source);
+        source.disconnect();
+        if (
+          this.finished &&
+          this.pendingSamples === 0 &&
+          this.sources.size === 0
+        ) {
+          this.maybeIdle();
+        }
+      };
+
+      try {
+        source.start(startAt);
+      } catch (error) {
+        this.sources.delete(source);
+        this.onError(error);
+        break;
+      }
+
+      this.nextStartTime = startAt + buffer.duration;
+      startAt = this.nextStartTime;
+      scheduled += size;
     }
 
     // If more deltas arrived while awaiting the context/buffer allocation,

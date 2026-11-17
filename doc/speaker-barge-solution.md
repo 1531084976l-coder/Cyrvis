@@ -330,3 +330,240 @@ cancelling
 - AEC 输出与 raw near 的混合比例 0/25/50/75%；
 - 真实双讲录音（用户实际说“停”“新任务”），而不是合成叠加；
 - 以 KWS/ASR 结果为准，不以声纹分数单独判定。
+
+## 14. 真实双讲验证与方案修正（2026-11-17）
+
+### 14.1 录音
+
+- 时长 13.6s；TTS 远端参考约 1.2–9.4s；
+- 麦克风：`cc ultimate`；外放：Realtek；
+- 用户在实际播放中重复说了“停一下 / 别说了”。
+
+### 14.2 KWS 结果（真实双讲）
+
+| 输入 | 检测结果 |
+|---|---|
+| 原始麦克风混合信号 | 3.1s `别说了`；5.6s `停一下`；6.9s `别说了` |
+| AEC3（far 前移 0ms） | 3.1s `别说了`；6.9s `别说了`；9.5s 尾部误报 `停` |
+| AEC3（far 前移 200ms，ERLE 较好） | 6.9s `别说了`；9.5s 尾部误报 `停` |
+| AEC3（far 延迟提示 300ms） | 无检测 |
+
+结论：**本样本中，AEC3 输出反而不如原始混合信号**。AEC3 在 2.0–3.0s 把用户人声当成回声压掉了 33.6dB（该窗口原始声纹 0.594，AEC 后 0.114），这是典型的双讲近端抑制问题。
+
+### 14.3 声纹门控（原始混合信号）
+
+| 时间窗 | 内容 | 声纹分数 |
+|---|---|---:|
+| 1.2–2.0s | 基本只有 TTS 回声 | 0.131 |
+| 2.0–3.0s | 用户说“别说了”前后 | 0.594 |
+| 3.0–4.0s | 用户语音 + 回声 | 0.472 |
+| 5.0–7.5s | 用户说“停一下/别说了” | 0.504 |
+| 7.5–9.5s | 主要是 TTS 尾音 | 0.310 |
+
+KWS 命中点附近取最近约 1s：
+- 3.1s 命中：0.508；
+- 5.6s 命中：0.394；
+- 6.9s 命中：0.500。
+
+因此当前实现采用：
+
+```text
+原始麦克风 PCM
+  └─> 本地 KWS（停/停一下/别说了/赛维斯停止）
+        └─> 声纹（最近 ~1s，阈值 0.35）
+              ├─ 通过：立即硬打断
+              └─ 不通过：视为助手自身 TTS 或他人，忽略并抑制旧能量路径 600ms
+```
+
+Node 侧验证：`sherpa-onnx-node` 的 ERes2Net 与 Python 分数一致，单次 embedding 15–44ms；KWS 3.3M 模型可在 Electron ABI 下加载。
+
+### 14.4 架构修正
+
+原方案把 AEC 放在 KWS 之前；真实数据表明这会伤害短停词识别。修正为：
+
+1. **停词路径不经过 AEC**：KWS 直接吃原始麦克风信号，声纹只做“是不是用户”的第二道门；
+2. **AEC 仅用于新任务 ASR**（Phase 4），并且必须先解决双讲近端抑制，不能默认上线；
+3. **声纹使用 KWS 精确命中窗口**，不再对任意混合音频做声纹——这是此前 0.02–0.30 失败与现在 0.39–0.59 成功的关键差异；
+4. 保留旧能量/相关性路径作为兜底，但 KWS 拒绝后 600ms 内不再让旧路径触发，避免“声纹说不是用户、能量却打断”的自相矛盾。
+
+### 14.5 当前代码
+
+- `apps/ui-tars/src/main/cyrvis/keyword-gate.ts`：KWS + 声纹门控；
+- `apps/ui-tars/src/main/cyrvis/voice-service.ts`：播放中每 20ms 送入 KWS，命中后走统一 `triggerBargeIn`；
+- `apps/ui-tars/resources/cyrvis/kws/keywords.txt`：停词表；
+- 依赖：`sherpa-onnx-node@2.0.1`；
+- 模型目录：`D:\Desktop\project\CYRVIS\models\kws\...`、`models\voiceprint\...`；
+- 声纹 enrollment 现在同时写 `user_embedding.npy` 与 `user_embedding.f32`。
+
+### 14.6 自回声拒绝验证
+
+用 Windows SAPI（Huihui zh-CN）生成一段助手话术：
+
+> “好的，已暂停当前任务，要停止吗？”
+
+KWS 在 2.1s / 3.7s 两次命中 `停`；声纹分数分别为 **0.106 / 0.123**，均低于阈值 0.35，因此被拒绝，不会自打断。对应用户真实双讲命中窗口的分数是 **0.39–0.59**，可以被接受。
+
+自动化测试：
+
+```bash
+cd apps/ui-tars
+npx vitest run src/main/cyrvis/keyword-gate.test.ts
+```
+
+- `accepts the user stop words in speaker mode`：真实双讲 → 3 次触发、0 次拒绝；
+- `rejects the assistant saying 暂停/停止 through the speaker path`：TTS 自回声 → 0 次触发、2 次拒绝。
+
+这验证了“KWS 原始麦 + 声纹门控”在当前硬件/话术下的可行边界。
+
+### 14.7 真机声纹分数与阈值修正（2026-11-17 11:27）
+
+真机外放（Realtek + `cc ultimate`）在 11:27:45 首次拿到完整链路日志：
+
+```text
+[cyrvis kws] detected { keyword: '别说了', speakerMode: true, playing: true }
+[cyrvis kws] voiceprint gate { score: 0.2696, threshold: 0.35, accepted: false }
+```
+
+离线同一句“别说了”在 3.0s 窗口是 0.562、6.9s 窗口是 0.409；真机只有 0.2696。差异来自：
+- Chromium 采集默认开了 `noiseSuppression: true` + `autoGainControl: true`；
+- 真机 1s 窗口里助手外放回声占比更高。
+
+修正：
+1. 隐藏采集窗关闭 Chromium NS/AGC，保留原始 PCM；
+2. 多字停词阈值 0.20，单字“停”0.25，声纹默认 0.22；
+3. 新增 300ms 能量 + 声纹快速兜底（阈值 0.22），用于 KWS 漏掉单字“停”；
+4. KWS 可用时禁用旧 `direct interrupt` 路径（实测最慢 13s）。
+
+11:31:20 能量兜底在助手自身外放上得分 0.0681，被正确拒绝，说明该兜底不会自打断。
+
+### 14.8 真机外放打断成功（2026-11-17 11:34）
+
+同一轮长诗播报中：
+
+```text
+11:34:24.009  detected '别说了'  score 0.0611  threshold 0.20  accepted false
+11:34:26.288  detected '别说了'  score 0.2931  threshold 0.20  accepted true
+11:34:26.312  keyword barge-in
+```
+
+第二次命中到执行打断 **24ms**。第一次分数 0.0611 更像助手 TTS 回声或用户刚开口的碎片，因此拒绝；用户重复一次后通过。旧阈值 0.35 会把第二次 0.2931 也拒掉，这是此前“听到了但不停”的直接原因。
+
+当前真机结论：
+- 多字停词（别说了/停一下）已验证可打断；
+- 单字“停”由 KWS 0.1 阈值 + 300ms 能量/声纹兜底覆盖，待单独复测；
+- 唤醒词被误判为回声的问题已修（Hello/service/savage 不再被丢）。
+
+### 14.9 A/B 实测结论：外放不能走纯能量（2026-11-17 11:55）
+
+外放模式 + `Ctrl+Alt+E` 开启纯能量后，助手刚开始说 “Hello” 就被连续自打断：
+
+```text
+11:55:28.666  barge-in { avg: 2693, mode: 'energy-only' }
+11:55:37.616  barge-in { avg: 4310, mode: 'energy-only' }
+11:55:47.356  barge-in { avg: 1956, mode: 'energy-only' }
+```
+
+这些能量全部来自 Realtek 外放回声，不是用户人声。结论：11:00 “好用”的时期是 **耳机语音模式 + Realtek 输出**（回声小），不是真正 speaker 模式；真正外放必须用 KWS + 声纹或能量+声纹。
+
+默认已改为 `CYRVIS_EXTERNAL_ENERGY_BARGE=0`；`Ctrl+Alt+E` 仍可用于现场复现对比。
+
+## 15. 双级打断与完整延迟测量（2026-11-17 13:10）
+
+### 15.1 强/弱关键词
+
+| 类型 | 关键词 | 策略 |
+|---|---|---|
+| 强 | 赛维斯停止 / 停一下 / 停一停 / 别说了 / 不要说了 | KWS 命中直接打断；仅当助手当前 TTS 文本也含停词时要求声纹 |
+| 弱 | 停 / 停下 / 停住 / 停啊 / 停了 | KWS + 声纹；TTS 文本含停词时阈值 0.25，否则 0.10 |
+
+强关键词的自回声测试：Huihui TTS “好的，别说了，我马上停止” 会命中强词，但 `ttsContainsStop=true` 时仍走声纹并被拒绝。
+
+### 15.2 完整延迟 trace
+
+主进程记录：
+`speechOnsetAt → detectedAt → verifiedAt → bargeAt`；渲染端在 `response-stopped` 停止 WebAudio 后回传 `queuedMs` 和 `stoppedAt`。
+
+日志字段：
+
+```text
+[cyrvis barge trace] {
+  keyword, score, accepted,
+  onsetToDetect, detectToVerify, detectToBarge,
+  bargeToStop, onsetToStop, responseToStop, queuedMs
+}
+```
+
+注意：`speechOnsetAt` 用 1800 能量阈值近似，可能包含回声起点；后续可换本地 VAD。
+
+### 15.3 失败样本落盘
+
+`CYRVIS_KWS_DUMP_FAILURES=1` 时，KWS 被声纹拒绝或能量兜底被拒绝，会把最近 3 秒原始 PCM 写到 `doc/kws-lab/failed-*.wav`，用于离线扫参。
+
+### 15.4 暂缓
+
+- Soft barge（12–18dB 快速 duck）留到 trace 数据出来后做，避免盲目改播放链路；
+- AEC3 与声纹阈值继续暂停；
+- P0 蓝牙稳定性由 Windows 录音机对照测试先定位。
+
+### 15.5 基线扫参结果（2026-11-17 13:16）
+
+`node scripts/cyrvis/kws-lab/sweep-kws.cjs`：
+
+| 文件 | threshold | blanks | 命中 |
+|---|---:|---:|---|
+| 真实双讲 | 0.05–0.10 | 0–1 | 3.1s 别说了 (0.527)、5.3s 停 (0.350)、6.9s 别说了 (0.450) |
+| 真实双讲 | 0.15 | 0–1 | 5.3s 变 5.6s 停下 (0.435) |
+| 真实双讲 | 0.20 | 0–1 | 丢掉 5.3–5.6s 的“停/停下” |
+| TTS “已暂停/要停止吗” | 任意 | 任意 | 仅 2.1s/3.7s “停”，声纹 0.095/0.131 |
+| TTS “别说了，我马上停止” | 任意 | 0–1 | 2.1s 别说了 (0.039)、3.7s 停 (0.117) |
+
+结论：
+- `keywordsThreshold=0.1`、`numTrailingBlanks=1` 是当前召回/延迟的平衡点；
+- `blanks=2` 会把 3.1s 命中推迟到 3.4s，并丢掉弱“停”；
+- 强词 TTS 自回声声纹只有 0.039/0.117，`ttsContainsStop` 门控可以安全拦截。
+
+## 16. 相对声纹：外放“任意说话即打断”（2026-11-18）
+
+绝对声纹分数在真机上有重叠（用户 0.0678–0.2725，TTS 回声 0.0265–0.0754）。改为同时比较：
+
+```text
+candidate = 最近 1s 麦克风混合音频的 embedding
+userScore = cosine(candidate, enrolled user)
+ttsScore  = cosine(candidate, 当前对齐的 TTS 播放参考)
+margin    = userScore - ttsScore
+```
+
+离线双讲样本：
+
+| 片段 | userScore | ttsScore | margin |
+|---|---:|---:|---:|
+| TTS-only 1.2–2.0s | 0.131 | 0.216 | -0.085 |
+| 用户 2.0–3.0s | 0.594 | 0.013 | +0.581 |
+| 用户 3.0–4.0s | 0.472 | -0.006 | +0.479 |
+| 用户 5.0–7.5s | 0.504 | 0.305 | +0.199 |
+| TTS 尾音 7.5–9.5s | 0.310 | 0.437 | -0.127 |
+
+实现：
+- `SpeakerEchoDetector.analyze` 返回对齐的 playback reference；
+- 主进程维护 `referencePreroll`（约 1s）；
+- 能量兜底改为 200ms / avg 1200；`margin > 0.05 && userScore > 0.04` 即打断；
+- KWS 命中时也用相对声纹复核（TTS 文本含停词时）。
+
+这使外放模式接近耳机模式的“正常说话就打断”，但用 TTS 参考而不是纯能量区分回声。
+
+### 16.1 长回复参考失效与修复（2026-11-18 00:26）
+
+真机长回复里 `relativeAvailable` 长期为 `false`，相对声纹整段失效。两个叠加原因：
+
+1. 渲染端 `WebAudioStreamPlayer.pump()` 把当时全部待播 PCM 拼成**一个** `AudioBuffer`，整段只上报一次 `onSegmentStart(startedAt)`。`SpeakerEchoDetector.prune()` 以段开始时间计龄，`MAX_REFERENCE_AGE_MS=5s`，播放超过 5s 后唯一参考段被删除，之后 `reference=null`。
+2. 改为 1s 分块后仍有第二层问题：队列会把几十秒的块**一次性**排到未来，每次 `addReference()` 如果用最新（未来）块的 `startedAt` 做 prune，会立刻删掉正在播放的近端参考。
+
+修复：
+
+| 位置 | 修改 |
+|---|---|
+| `webaudio-player.ts` | 待播 PCM 按 1s 分块调度，每块独立 `startedAt` / `onSegmentStart`，参考在整个长回复期间保持对齐 |
+| `speaker-barge.ts` | `addReference()` 用最近一次 `analyze()` 的采集时钟 prune，保留未来已排队段；`analyze()` 跳过尚未开始的段，只淘汰播放超过 5s 的参考 |
+| `speaker-barge.test.ts` | 新增“长回复排队时保留近端参考”用例 |
+
+验证：`typecheck:node` / `typecheck:web` 通过，cyrvis 单测 79/79 通过（speaker-barge 6/6）。真机外放“任意说话”复测待执行。

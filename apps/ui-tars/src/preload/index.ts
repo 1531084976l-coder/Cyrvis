@@ -160,6 +160,8 @@ const electronHandler = {
     sendPlaybackReference: (buffer: ArrayBuffer, startedAt?: number) =>
       ipcRenderer.send('cyrvis:voice:playback-reference', buffer, startedAt),
     notifyPlaybackIdle: () => ipcRenderer.send('cyrvis:voice:playback-idle'),
+    notifyPlaybackStopped: (info?: { queuedMs?: number }) =>
+      ipcRenderer.send('cyrvis:voice:playback-stopped', info),
     bargeIn: () => ipcRenderer.send('cyrvis:voice:barge-in'),
     forceAwake: () => ipcRenderer.send('cyrvis:voice:force-awake'),
     sleep: () => ipcRenderer.send('cyrvis:voice:sleep'),
