@@ -210,9 +210,13 @@ export const startCaptureService = async (
   const port = (server.address() as AddressInfo).port;
 
   wss.on('connection', (socket) => {
-    socket.on('message', (data: Buffer, isBinary: boolean) => {
+    socket.on('message', (data, isBinary: boolean) => {
       if (isBinary) {
-        const buffer = Buffer.from(data);
+        const buffer = Buffer.isBuffer(data)
+          ? data
+          : Array.isArray(data)
+            ? Buffer.concat(data)
+            : Buffer.from(data);
         if (buffer.byteLength >= 2) {
           handlers.onPcm(
             new Int16Array(

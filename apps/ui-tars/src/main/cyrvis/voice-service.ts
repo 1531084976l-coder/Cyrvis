@@ -11,6 +11,9 @@ import { app, BrowserWindow, globalShortcut, ipcMain } from 'electron';
 
 import * as env from '@main/env';
 import { logger } from '@main/logger';
+import { SettingStore } from '@main/store/setting';
+import { breezeTtsService } from '@main/services/breezeTts';
+import { qwenTtsRealtimeService } from '@main/services/qwenTtsRealtime';
 import {
   describeControllerEvent,
   describeVoiceToolCall,
@@ -26,17 +29,20 @@ import { KeywordGate } from './keyword-gate';
 import { voiceMemoryService } from './memory';
 import { SpeakerEchoDetector, type SpeakerEchoAnalysis } from './speaker-barge';
 import { isLikelySpeakerEcho } from './speaker-echo';
+import { CascadeVoiceProvider } from './voice/cascade-provider';
 import { QwenOmniProvider } from './voice/qwen-omni';
+import type { InteractiveVoiceProvider } from './voice/provider';
 import { VoiceBrain, type VoiceBrainState } from './voice-brain';
 import type { ControllerEvent } from './types';
 
 interface VoiceService {
   brain: VoiceBrain;
-  provider: QwenOmniProvider;
+  provider: InteractiveVoiceProvider;
   controller: CyrvisController;
 }
 
 let service: VoiceService | null = null;
+let selectedVoiceEngine: 'cascade' | 'omni' = env.voiceEngine;
 let captureService: CaptureService | null = null;
 let captureReady = false;
 let captureGeneration = 0;
@@ -95,6 +101,10 @@ const VOICE_FALLBACK_SUSTAIN_MS = 200;
 const VOICE_FALLBACK_THRESHOLD = 1200;
 const VOICE_FALLBACK_COOLDOWN_MS = 700;
 const VOICE_FALLBACK_VOICEPRINT = 0.22;
+const BARGE_MIC_TAIL_MS = {
+  cascade: 150,
+  omni: 800,
+} as const;
 const BARGE_SAMPLE_DIR = path.resolve(process.cwd(), '../../doc/kws-lab');
 const BARGE_SAMPLE_MAX_CHUNKS = 150; // 3s at 20ms
 const BARGE_SAMPLE_DUMP_INTERVAL_MS = 3000;
@@ -173,6 +183,7 @@ let speakerCandidateMs = 0;
 // short "停" is never lost to a 700ms probe confirmation window.
 let headsetBargeMs = 0;
 let speakerResumeSuppressUntil = 0;
+let deferredBargeGuiStop = false;
 let lastSpeakerDiagnosticAt = 0;
 let voiceprintPending = false;
 let lastVoiceprintAt = 0;
@@ -205,7 +216,9 @@ let keywordRejectUntil = 0;
 // Runtime A/B switch (Ctrl+Alt+E): pure 1500/180ms energy barge, including
 // external output. Off = KWS + voiceprint. Started from
 // CYRVIS_EXTERNAL_ENERGY_BARGE for reproducing the 11:00 behavior.
-let energyOnlyBarge = process.env.CYRVIS_EXTERNAL_ENERGY_BARGE === '1';
+let energyOnlyBarge =
+  selectedVoiceEngine === 'cascade' ||
+  process.env.CYRVIS_EXTERNAL_ENERGY_BARGE === '1';
 let voiceFallbackMs = 0;
 let lastVoiceFallbackAt = 0;
 let lastDeviceChangeRetryAt = 0;
@@ -344,7 +357,7 @@ const finishSpeakerBargeIn = (_buffered: Int16Array[]): void => {
   speakerEchoDetector.reset();
   capturePreroll = [];
   service.provider.bargeIn({ forceCommit: false });
-  service.provider.muteMicFor(800);
+  service.provider.muteMicFor(BARGE_MIC_TAIL_MS[selectedVoiceEngine]);
   service.brain.forceAwake();
   service.brain.handleBargeStop();
   broadcast('cyrvis:voice:response-stopped');
@@ -796,12 +809,16 @@ const handleCapturePcm = (pcm16: Int16Array): void => {
     // Headset-routed playback, or the explicit 11:00 comparison mode where
     // external output is also allowed to use the fast energy path.
     const chunkMs = (pcm16.length / 16000) * 1000;
-    if (average > CAPTURE_BARGE_THRESHOLD) {
+    const bargeThreshold =
+      selectedVoiceEngine === 'cascade' ? 1800 : CAPTURE_BARGE_THRESHOLD;
+    const bargeSustainMs =
+      selectedVoiceEngine === 'cascade' ? 150 : CAPTURE_BARGE_SUSTAIN_MS;
+    if (average > bargeThreshold) {
       headsetBargeMs += chunkMs;
     } else {
       headsetBargeMs = Math.max(0, headsetBargeMs - chunkMs);
     }
-    if (headsetBargeMs >= CAPTURE_BARGE_SUSTAIN_MS) {
+    if (headsetBargeMs >= bargeSustainMs) {
       logger.info('[cyrvis capture] barge-in', {
         avg: Math.round(average),
         mode: externalEnergyBarge ? 'energy-only' : 'headset',
@@ -810,7 +827,7 @@ const handleCapturePcm = (pcm16: Int16Array): void => {
       assistantPlaybackActive = false;
       capturePreroll = [];
       service.provider.bargeIn({ forceCommit: false });
-      service.provider.muteMicFor(800);
+      service.provider.muteMicFor(BARGE_MIC_TAIL_MS[selectedVoiceEngine]);
       service.brain.forceAwake();
       service.brain.handleBargeStop();
       broadcast('cyrvis:voice:response-stopped');
@@ -927,10 +944,9 @@ const startCapture = async (resetRetries = false): Promise<void> => {
           scheduleCaptureRetry('Microphone disconnected');
         },
       },
-      // The capture renderer has no reference signal from the playback
-      // renderer. Keep browser AEC off and perform reference-aware gating in
-      // the main process instead.
-      { echoCancellation: false },
+      // Cascade follows UI-tars and uses browser AEC. The omni fallback keeps
+      // Cyrvis's previous reference-aware capture behavior.
+      { echoCancellation: selectedVoiceEngine === 'cascade' },
     );
   } catch (error) {
     if (generation === captureGeneration) {
@@ -973,7 +989,7 @@ const syncProviderMemoryContext = async (): Promise<void> => {
   if (!service) {
     return;
   }
-  service.provider.setContext(await voiceMemoryService.getContext());
+  service.provider.setContext?.(await voiceMemoryService.getContext());
 };
 
 const recordTurn = (role: CyrvisMemoryTurnRole, text: string): void => {
@@ -993,6 +1009,7 @@ const triggerBargeIn = () => {
   if (!service) {
     return;
   }
+  deferredBargeGuiStop = false;
   logger.info('[cyrvis voice] barge-in');
   if (bargeTrace) {
     bargeTrace.bargeAt = Date.now();
@@ -1006,7 +1023,7 @@ const triggerBargeIn = () => {
   resetSpeakerDetection();
   service.provider.bargeIn({ forceCommit: false });
   if (wasPlaying) {
-    service.provider.muteMicFor(800);
+    service.provider.muteMicFor(BARGE_MIC_TAIL_MS[selectedVoiceEngine]);
   }
   service.brain.forceAwake();
   service.brain.handleBargeStop();
@@ -1104,6 +1121,65 @@ const registerVoiceIpc = () => {
     service.provider.sendAudio(new Int16Array(buffer));
   });
 
+  ipcMain.on('cyrvis:voice:begin-utterance', () => {
+    service?.provider.beginUtterance?.();
+  });
+
+  ipcMain.on('cyrvis:voice:finish-utterance', () => {
+    service?.provider.finishUtterance?.();
+  });
+
+  ipcMain.on('cyrvis:voice:cancel-utterance', () => {
+    service?.provider.cancelUtterance?.();
+  });
+
+  ipcMain.on('cyrvis:voice:renderer-capture-ready', (_event, label: string) => {
+    captureReady = true;
+    broadcast('cyrvis:voice:capture-ready', {
+      label: label || 'renderer microphone',
+    });
+  });
+
+  ipcMain.on(
+    'cyrvis:voice:renderer-capture-error',
+    (_event, message: string) => {
+      captureReady = false;
+      broadcast('cyrvis:voice:capture-error', {
+        message: message || 'renderer microphone error',
+      });
+    },
+  );
+
+  ipcMain.handle('qwen-tts:start', (_event, input) =>
+    qwenTtsRealtimeService.start(input),
+  );
+  ipcMain.handle('qwen-tts:append', (_event, input) =>
+    qwenTtsRealtimeService.append(input),
+  );
+  ipcMain.handle('qwen-tts:finish', (_event, input) =>
+    qwenTtsRealtimeService.finish(input.sessionId),
+  );
+  ipcMain.handle('qwen-tts:cancel', (_event, input) =>
+    qwenTtsRealtimeService.cancel(input.sessionId),
+  );
+  ipcMain.handle('qwen-tts:prepare-voice', (_event, input) =>
+    qwenTtsRealtimeService.ensureVoice(input),
+  );
+  ipcMain.handle('qwen-tts:ensure-breeze-ready', async () => {
+    try {
+      await breezeTtsService.ensureStarted();
+      return { ok: true };
+    } catch (error) {
+      return {
+        ok: false,
+        error: error instanceof Error ? error.message : String(error),
+      };
+    }
+  });
+  ipcMain.handle('qwen-tts:list-breeze-voices', () =>
+    breezeTtsService.listVoices(),
+  );
+
   ipcMain.on(
     'cyrvis:voice:playback-reference',
     (_event, buffer: ArrayBuffer, startedAt?: number) => {
@@ -1159,6 +1235,9 @@ const registerVoiceIpc = () => {
     logger.info('[cyrvis voice] test audio start', { bytes: data.length });
     testAudioActive = true;
     service.provider.clearAudioBuffer();
+    if (selectedVoiceEngine === 'cascade') {
+      service.provider.beginUtterance?.();
+    }
     try {
       const chunkSize = 640; // 20 ms at 16 kHz PCM16 mono
       for (let i = 0; i < data.length; i += chunkSize) {
@@ -1171,11 +1250,14 @@ const registerVoiceIpc = () => {
         service.provider.sendAudio(pcm);
         await new Promise((resolve) => setTimeout(resolve, 20));
       }
-      // Local VAD needs to observe trailing silence before committing.
+      // Streaming ASR needs trailing silence before the manual commit.
       const silence = new Int16Array(16000); // 1 second at 16 kHz
       for (let i = 0; i < silence.length; i += 320) {
         service.provider.sendAudio(silence.subarray(i, i + 320));
         await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+      if (selectedVoiceEngine === 'cascade') {
+        service.provider.finishUtterance?.();
       }
     } finally {
       testAudioActive = false;
@@ -1207,7 +1289,7 @@ const registerVoiceIpc = () => {
       echoCancellation: false,
     });
     broadcast('cyrvis:voice:audio-mode', { mode: audioMode });
-    if (changed) {
+    if (changed && selectedVoiceEngine === 'omni') {
       // Bluetooth profile/A2DP switches briefly drop the HFP microphone.
       await new Promise((resolve) => setTimeout(resolve, 500));
       try {
@@ -1244,6 +1326,9 @@ const registerVoiceIpc = () => {
   });
 
   ipcMain.handle('cyrvis:voice:restart-capture', async () => {
+    if (selectedVoiceEngine === 'cascade') {
+      return { ok: true, rendererOwned: true };
+    }
     try {
       await startCapture(true);
       return { ok: true };
@@ -1313,6 +1398,19 @@ const registerVoiceIpc = () => {
     triggerBargeIn();
   });
 
+  ipcMain.on('cyrvis:voice:cancel-speech-only', () => {
+    if (!service) {
+      return;
+    }
+    logger.info('[cyrvis voice] speech-only barge-in');
+    assistantPlaybackActive = false;
+    deferredBargeGuiStop = true;
+    service.provider.bargeIn({ forceCommit: false });
+    service.provider.muteMicFor(BARGE_MIC_TAIL_MS[selectedVoiceEngine]);
+    service.brain.forceAwake();
+    broadcast('cyrvis:voice:response-stopped');
+  });
+
   ipcMain.on('cyrvis:voice:force-awake', () => {
     service?.brain.forceAwake();
   });
@@ -1336,8 +1434,17 @@ export const startVoiceService = (): VoiceService | null => {
     return service;
   }
 
-  const apiKey = process.env.QWEN_API_KEY;
-  if (!apiKey) {
+  const settings = SettingStore.getStore();
+  selectedVoiceEngine = settings.voiceEngine || env.voiceEngine;
+  if (settings.voiceEnabled === false) {
+    logger.info('[cyrvis voice] disabled by settings');
+    return null;
+  }
+  energyOnlyBarge =
+    selectedVoiceEngine === 'cascade' ||
+    process.env.CYRVIS_EXTERNAL_ENERGY_BARGE === '1';
+  const apiKey = process.env.QWEN_API_KEY || '';
+  if (selectedVoiceEngine === 'omni' && !apiKey) {
     logger.warn(
       '[cyrvis voice] QWEN_API_KEY is not set; voice service is disabled',
     );
@@ -1345,7 +1452,22 @@ export const startVoiceService = (): VoiceService | null => {
   }
 
   const controller = new CyrvisController(new ElectronGUIAdapter());
-  let provider!: QwenOmniProvider;
+  let provider!: InteractiveVoiceProvider;
+  const requireWakeWord = settings.voiceRequireWakeWord ?? true;
+  const configuredWakeWord = settings.voiceWakeWord?.trim();
+  const escapeRegExp = (value: string) =>
+    value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const wakePatterns = configuredWakeWord
+    ? [
+        new RegExp(
+          `(?:hello|hi|hey|你好|小T)?[\\s,，]*${escapeRegExp(
+            configuredWakeWord,
+          )}`,
+          'i',
+        ),
+        /\b(cyrvis|service|sirvis|cervis|siris|sirius)\b/i,
+      ]
+    : undefined;
 
   const brain = new VoiceBrain(
     controller,
@@ -1377,6 +1499,9 @@ export const startVoiceService = (): VoiceService | null => {
           recordTurn('assistant', text);
         }
       },
+      onSpeechText: (text, final) => {
+        broadcast('cyrvis:voice:speech-text', { text, final });
+      },
       onState: (state: VoiceBrainState) =>
         broadcast('cyrvis:voice:state', state),
       onWake: () => {
@@ -1405,12 +1530,24 @@ export const startVoiceService = (): VoiceService | null => {
       const wrapped = {
         ...callbacks,
         onReady: () => {
-          logger.info('[cyrvis voice] qwen session ready');
+          logger.info('[cyrvis voice] provider ready', {
+            engine: selectedVoiceEngine,
+          });
           emitActivity('session', 'Qwen Realtime 已连接');
           callbacks.onReady?.();
         },
         onTranscript: (text: string, final: boolean) => {
           logger.info('[cyrvis voice] transcript', { text, final });
+          if (final && deferredBargeGuiStop) {
+            deferredBargeGuiStop = false;
+            const keepGuiRunning =
+              /暂停|继续|恢复|进度|第几步|pause|resume|progress|status/i.test(
+                text,
+              );
+            if (!keepGuiRunning && service) {
+              service.brain.handleBargeStop();
+            }
+          }
           if (
             final &&
             isLikelySpeakerEcho(
@@ -1506,32 +1643,33 @@ export const startVoiceService = (): VoiceService | null => {
         },
         onError: (error: Error) => {
           logger.error('[cyrvis voice] provider error', error);
+          broadcast('cyrvis:voice:error', { message: error.message });
           emitActivity('error', `语音模型错误：${error.message}`);
           callbacks.onError?.(error);
         },
       };
 
-      provider = new QwenOmniProvider({
-        apiKey,
-        model: process.env.QWEN_MODEL || 'qwen3.8-omni-flash-realtime',
-        endpoint: process.env.QWEN_REALTIME_URL || undefined,
-        voice: process.env.QWEN_VOICE || undefined,
-        callbacks: wrapped,
-        vadType: 'semantic_vad_ec',
-        // 1.2s felt like the assistant was deaf: users repeat "Hello" before
-        // the endpoint fires, which extends the utterance and delays it more.
-        // 800ms keeps natural pauses while making the first reply snappier.
-        // 800ms felt sluggish. 400ms is near the practical floor for Chinese
-        // speech: shorter values start splitting normal sentence pauses.
-        silenceDurationMs: 400,
-      });
+      provider =
+        selectedVoiceEngine === 'cascade'
+          ? new CascadeVoiceProvider(wrapped)
+          : new QwenOmniProvider({
+              apiKey,
+              model: process.env.QWEN_MODEL || 'qwen3.8-omni-flash-realtime',
+              endpoint: process.env.QWEN_REALTIME_URL || undefined,
+              voice: process.env.QWEN_VOICE || undefined,
+              callbacks: wrapped,
+              vadType: 'semantic_vad_ec',
+              silenceDurationMs:
+                settings.voiceSilenceTimeoutMs ||
+                env.voiceSilenceTimeoutMs ||
+                600,
+            });
       return provider;
     },
     {
-      // Hands-free: the app listens continuously while it is running. The
-      // provider's half-duplex gate mutes the mic while the assistant speaks.
-      requireWakeWord: false,
-      awakeTimeoutMs: 0,
+      requireWakeWord,
+      awakeTimeoutMs: requireWakeWord ? 20_000 : 0,
+      wakePatterns,
       proactivity: {
         minGapMs: 5000,
         progressCooldownMs: 30000,
@@ -1549,32 +1687,34 @@ export const startVoiceService = (): VoiceService | null => {
 
   service = { brain, provider, controller };
 
-  // Load the local stop-word models before capture starts. If a model is
-  // missing the voice service still works; only the keyword fast-path is off.
-  keywordGate = new KeywordGate({
-    onTrigger: (keyword) => {
-      logger.info('[cyrvis voice] keyword barge-in', { keyword });
-      triggerBargeIn();
-    },
-    onDetected: (keyword, at) => {
-      if (bargeTrace) {
-        bargeTrace.keyword = keyword;
-        bargeTrace.detectedAt = at;
-      }
-    },
-    onVerified: (keyword, score, accepted, at) => {
-      if (bargeTrace) {
-        bargeTrace.keyword = keyword;
-        bargeTrace.score = score;
-        bargeTrace.accepted = accepted;
-        bargeTrace.verifiedAt = at;
-      }
-    },
-    onReject: (keyword, score) => {
-      dumpBargeFailure('kws-rejected', keyword, score);
-    },
-  });
-  keywordGate.load();
+  if (selectedVoiceEngine === 'omni') {
+    // Load the local stop-word models before capture starts. If a model is
+    // missing the voice service still works; only the keyword fast-path is off.
+    keywordGate = new KeywordGate({
+      onTrigger: (keyword) => {
+        logger.info('[cyrvis voice] keyword barge-in', { keyword });
+        triggerBargeIn();
+      },
+      onDetected: (keyword, at) => {
+        if (bargeTrace) {
+          bargeTrace.keyword = keyword;
+          bargeTrace.detectedAt = at;
+        }
+      },
+      onVerified: (keyword, score, accepted, at) => {
+        if (bargeTrace) {
+          bargeTrace.keyword = keyword;
+          bargeTrace.score = score;
+          bargeTrace.accepted = accepted;
+          bargeTrace.verifiedAt = at;
+        }
+      },
+      onReject: (keyword, score) => {
+        dumpBargeFailure('kws-rejected', keyword, score);
+      },
+    });
+    keywordGate.load();
+  }
 
   if (pttMode) {
     const shortcutRegistered = globalShortcut.register(
@@ -1596,28 +1736,32 @@ export const startVoiceService = (): VoiceService | null => {
   });
 
   // A/B switch for the 11:00 energy behavior. No restart needed.
-  const energyShortcut = globalShortcut.register('Control+Alt+E', () => {
-    energyOnlyBarge = !energyOnlyBarge;
-    resetSpeakerDetection();
-    keywordGate?.reset();
-    logger.info('[cyrvis voice] energy-only barge toggled', {
-      enabled: energyOnlyBarge,
+  if (selectedVoiceEngine === 'omni') {
+    const energyShortcut = globalShortcut.register('Control+Alt+E', () => {
+      energyOnlyBarge = !energyOnlyBarge;
+      resetSpeakerDetection();
+      keywordGate?.reset();
+      logger.info('[cyrvis voice] energy-only barge toggled', {
+        enabled: energyOnlyBarge,
+      });
+      emitActivity(
+        'speech',
+        energyOnlyBarge ? '纯能量打断：开' : 'KWS + 声纹打断：开',
+      );
     });
-    emitActivity(
-      'speech',
-      energyOnlyBarge ? '纯能量打断：开' : 'KWS + 声纹打断：开',
-    );
-  });
-  logger.info('[cyrvis voice] energy-only barge shortcut', {
-    accelerator: 'Control+Alt+E',
-    enabled: energyOnlyBarge,
-    registered: energyShortcut,
-  });
+    logger.info('[cyrvis voice] energy-only barge shortcut', {
+      accelerator: 'Control+Alt+E',
+      enabled: energyOnlyBarge,
+      registered: energyShortcut,
+    });
+  }
 
   app.on('before-quit', () => {
     globalShortcut.unregisterAll();
     captureService?.close();
     captureService = null;
+    breezeTtsService.stop();
+    qwenTtsRealtimeService.stopAll();
     keywordGate = null;
     brain.dispose();
     service = null;
@@ -1627,8 +1771,14 @@ export const startVoiceService = (): VoiceService | null => {
   brain
     .start()
     .then(async () => {
-      logger.info('[cyrvis voice] qwen connected');
-      await startCapture();
+      logger.info('[cyrvis voice] provider connected', {
+        engine: selectedVoiceEngine,
+      });
+      if (settings.voiceTtsProvider === 'breeze-local') {
+        void breezeTtsService.ensureStarted().catch((error: unknown) => {
+          logger.warn('[cyrvis voice] Breeze TTS prewarm failed', error);
+        });
+      }
     })
     .catch((error) => {
       logger.error('[cyrvis voice] connect/capture failed', error);

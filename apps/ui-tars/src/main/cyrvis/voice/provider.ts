@@ -13,6 +13,7 @@ export interface VoiceProviderCallbacks {
   onSpeechStopped?: () => void;
   onTranscript?: (text: string, final: boolean) => void;
   onAssistantText?: (text: string, final: boolean) => void;
+  onSpeechText?: (text: string, final: boolean) => void;
   onToolCall?: (call: VoiceToolCallWithId) => void;
   onAudio?: (pcm16: Int16Array) => void;
   onResponseStarted?: () => void;
@@ -37,6 +38,22 @@ export interface VoiceProvider {
   /** Ask the voice to speak a short proactive line. */
   speak(text: string): void;
   close(): void;
+}
+
+/**
+ * Runtime controls used by the desktop capture/playback shell. Both the
+ * realtime omni provider and the ASR -> LLM -> TTS cascade implement this
+ * interface so VoiceService does not depend on a vendor-specific class.
+ */
+export interface InteractiveVoiceProvider extends VoiceProvider {
+  beginUtterance?(): void;
+  finishUtterance?(): void;
+  cancelUtterance?(): void;
+  bargeIn(options?: { forceCommit?: boolean }): void;
+  clearAudioBuffer(): void;
+  muteMicFor(ms: number): void;
+  notifyPlaybackIdle(tailMs?: number): void;
+  endPtt(): void;
 }
 
 export const DEFAULT_VOICE_INSTRUCTIONS = `你是 CYRVIS，一个可以操作 Windows 电脑的语音助手。

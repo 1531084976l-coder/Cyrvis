@@ -4,12 +4,12 @@
  */
 import { randomUUID } from 'node:crypto';
 
-import WebSocket from 'ws';
+import WebSocket, { type RawData } from 'ws';
 
 import type { VoiceToolCall } from '../types';
 import {
   DEFAULT_VOICE_INSTRUCTIONS,
-  type VoiceProvider,
+  type InteractiveVoiceProvider,
   type VoiceProviderCallbacks,
 } from './provider';
 import { CYRVIS_VOICE_TOOLS, type QwenToolDefinition } from './tools';
@@ -60,7 +60,7 @@ const toInt16 = (base64: string): Int16Array => {
  * Verified against the DashScope realtime endpoint with a workspace-scoped
  * `sk-ws-...` key. Audio is 16 kHz PCM16 input and 24 kHz PCM16 output.
  */
-export class QwenOmniProvider implements VoiceProvider {
+export class QwenOmniProvider implements InteractiveVoiceProvider {
   private ws: WebSocket | null = null;
   private connected = false;
   private pendingConnect: PendingConnect | null = null;
@@ -524,7 +524,12 @@ export class QwenOmniProvider implements VoiceProvider {
     }, delay);
   }
 
-  private handleMessage(data: Buffer): void {
+  private handleMessage(raw: RawData): void {
+    const data = Buffer.isBuffer(raw)
+      ? raw
+      : Array.isArray(raw)
+        ? Buffer.concat(raw)
+        : Buffer.from(raw);
     let event: Record<string, unknown>;
     try {
       event = JSON.parse(data.toString()) as Record<string, unknown>;

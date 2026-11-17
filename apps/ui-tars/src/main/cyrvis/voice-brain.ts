@@ -22,6 +22,7 @@ export interface VoiceBrainCallbacks {
   onSpeechStopped?: () => void;
   onTranscript?: (text: string, final: boolean) => void;
   onAssistantText?: (text: string, final: boolean) => void;
+  onSpeechText?: (text: string, final: boolean) => void;
   onState?: (state: VoiceBrainState) => void;
   onWake?: () => void;
   onSleep?: () => void;
@@ -58,6 +59,12 @@ const normalize = (text: string) =>
     .replace(/[，。！？、,.!?;；:：""''“”‘’]/g, ' ')
     .replace(/\s+/g, ' ')
     .trim();
+
+const normalizeTranscriptDedupeKey = (text: string) =>
+  text
+    .normalize('NFKC')
+    .toLowerCase()
+    .replace(/[\p{P}\p{S}\s]/gu, '');
 
 /**
  * The conversational brain.
@@ -269,11 +276,19 @@ export class VoiceBrain {
         if (this.shouldSuppressReply()) {
           return;
         }
+        if (text.trim()) {
+          this.responseHadAudio = true;
+        }
         if (final && text.trim()) {
           this.lastAssistantText = text;
         }
         this.guardCompletionClaim(text);
         this.callbacks.onAssistantText?.(text, final);
+      },
+      onSpeechText: (text, final) => {
+        if (!this.shouldSuppressReply()) {
+          this.callbacks.onSpeechText?.(text, final);
+        }
       },
       onToolCall: (call) => {
         void this.handleToolCall(call).catch((error: unknown) => {
@@ -360,11 +375,16 @@ export class VoiceBrain {
     }
 
     const now = Date.now();
-    if (text === this.lastFinalTranscript && now - this.lastFinalAt < 3000) {
+    const transcriptKey = normalizeTranscriptDedupeKey(text);
+    if (
+      transcriptKey &&
+      transcriptKey === this.lastFinalTranscript &&
+      now - this.lastFinalAt < 6000
+    ) {
       console.log('[cyrvis voice] duplicate transcript ignored');
       return;
     }
-    this.lastFinalTranscript = text;
+    this.lastFinalTranscript = transcriptKey;
     this.lastFinalAt = now;
 
     // Speaker mode: the mic can pick up the assistant's own voice. If ASR

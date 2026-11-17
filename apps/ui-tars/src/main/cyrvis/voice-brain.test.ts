@@ -436,6 +436,19 @@ describe('VoiceBrain', () => {
     expect(wakeEvents).toContain('sleep');
   });
 
+  it('stays awake when wake word is disabled', async () => {
+    vi.useFakeTimers();
+    const { brain } = setup({
+      requireWakeWord: false,
+      awakeTimeoutMs: 0,
+    });
+    await brain.start();
+
+    expect(brain.getState().awake).toBe(true);
+    vi.advanceTimersByTime(60_000);
+    expect(brain.getState().awake).toBe(true);
+  });
+
   it('speaks proactive task completion', async () => {
     const { brain, provider, adapter } = setup();
     await brain.start();

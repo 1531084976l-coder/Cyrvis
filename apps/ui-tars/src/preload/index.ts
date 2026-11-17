@@ -16,6 +16,14 @@ import type {
   TaskSnapshot,
   VoiceToolName,
 } from '@shared/cyrvis';
+import type {
+  QwenTtsRealtimeAppendInput,
+  QwenTtsRealtimeSessionActionInput,
+  QwenTtsRealtimeSessionInput,
+  QwenTtsRealtimeStreamEvent,
+  QwenTtsVoiceEnrollmentInput,
+} from '@shared/qwenTtsRealtime';
+import type { BreezeTtsVoice } from '@shared/breezeTts';
 
 export type Channels = '';
 
@@ -82,7 +90,7 @@ const electronHandler = {
     isTestMode: process.env.CYRVIS_VOICE_TEST === '1',
     // Capture runs in a hidden renderer that never plays audio; the main
     // renderer keeps playback only.
-    externalCapture: true,
+    externalCapture: false,
     onCaptureReady: (callback: (payload: { label: string }) => void) => {
       const listener = (_event: IpcRendererEvent, payload: { label: string }) =>
         callback(payload);
@@ -100,6 +108,10 @@ const electronHandler = {
         ipcRenderer.removeListener('cyrvis:voice:capture-error', listener);
     },
     restartCapture: () => ipcRenderer.invoke('cyrvis:voice:restart-capture'),
+    notifyCaptureReady: (label: string) =>
+      ipcRenderer.send('cyrvis:voice:renderer-capture-ready', label),
+    notifyCaptureError: (message: string) =>
+      ipcRenderer.send('cyrvis:voice:renderer-capture-error', message),
     getCaptureReady: () =>
       ipcRenderer.invoke('cyrvis:voice:get-capture-ready') as Promise<{
         ready: boolean;
@@ -157,12 +169,17 @@ const electronHandler = {
       ) as Promise<TaskSnapshot | null>,
     sendAudio: (buffer: ArrayBuffer) =>
       ipcRenderer.send('cyrvis:voice:audio', buffer),
+    beginUtterance: () => ipcRenderer.send('cyrvis:voice:begin-utterance'),
+    finishUtterance: () => ipcRenderer.send('cyrvis:voice:finish-utterance'),
+    cancelUtterance: () => ipcRenderer.send('cyrvis:voice:cancel-utterance'),
     sendPlaybackReference: (buffer: ArrayBuffer, startedAt?: number) =>
       ipcRenderer.send('cyrvis:voice:playback-reference', buffer, startedAt),
     notifyPlaybackIdle: () => ipcRenderer.send('cyrvis:voice:playback-idle'),
     notifyPlaybackStopped: (info?: { queuedMs?: number }) =>
       ipcRenderer.send('cyrvis:voice:playback-stopped', info),
     bargeIn: () => ipcRenderer.send('cyrvis:voice:barge-in'),
+    cancelSpeechOnly: () =>
+      ipcRenderer.send('cyrvis:voice:cancel-speech-only'),
     forceAwake: () => ipcRenderer.send('cyrvis:voice:force-awake'),
     sleep: () => ipcRenderer.send('cyrvis:voice:sleep'),
     onAudio: (callback: (pcm16: Int16Array) => void) => {
@@ -176,6 +193,33 @@ const electronHandler = {
         }
       };
     },
+    startQwenTtsSession: (input: QwenTtsRealtimeSessionInput) =>
+      ipcRenderer.invoke('qwen-tts:start', input),
+    appendQwenTtsText: (input: QwenTtsRealtimeAppendInput) =>
+      ipcRenderer.invoke('qwen-tts:append', input),
+    finishQwenTtsSession: (input: QwenTtsRealtimeSessionActionInput) =>
+      ipcRenderer.invoke('qwen-tts:finish', input),
+    cancelQwenTtsSession: (input: QwenTtsRealtimeSessionActionInput) =>
+      ipcRenderer.invoke('qwen-tts:cancel', input),
+    prepareQwenTtsVoice: (input?: QwenTtsVoiceEnrollmentInput) =>
+      ipcRenderer.invoke('qwen-tts:prepare-voice', input),
+    onQwenTtsEvent: (callback: (event: QwenTtsRealtimeStreamEvent) => void) => {
+      const listener = (
+        _event: IpcRendererEvent,
+        streamEvent: QwenTtsRealtimeStreamEvent,
+      ) => callback(streamEvent);
+      ipcRenderer.on('qwen-tts:stream', listener);
+      return () => ipcRenderer.removeListener('qwen-tts:stream', listener);
+    },
+    ensureBreezeReady: () =>
+      ipcRenderer.invoke('qwen-tts:ensure-breeze-ready') as Promise<{
+        ok: boolean;
+        error?: string;
+      }>,
+    listBreezeVoices: () =>
+      ipcRenderer.invoke('qwen-tts:list-breeze-voices') as Promise<
+        BreezeTtsVoice[]
+      >,
     debugAudioSubscribers: () => ({
       active: activeAudioCallback !== null,
       total: audioSubscriberCount,
@@ -213,6 +257,26 @@ const electronHandler = {
       ipcRenderer.on('cyrvis:voice:assistant', listener);
       return () =>
         ipcRenderer.removeListener('cyrvis:voice:assistant', listener);
+    },
+    onSpeechText: (
+      callback: (payload: { text: string; final: boolean }) => void,
+    ) => {
+      const listener = (
+        _event: IpcRendererEvent,
+        payload: { text: string; final: boolean },
+      ) => callback(payload);
+      ipcRenderer.on('cyrvis:voice:speech-text', listener);
+      return () =>
+        ipcRenderer.removeListener('cyrvis:voice:speech-text', listener);
+    },
+    onError: (callback: (payload: { message: string }) => void) => {
+      const listener = (
+        _event: IpcRendererEvent,
+        payload: { message: string },
+      ) => callback(payload);
+      ipcRenderer.on('cyrvis:voice:error', listener);
+      return () =>
+        ipcRenderer.removeListener('cyrvis:voice:error', listener);
     },
     onState: (callback: (state: CyrvisVoiceState) => void) => {
       const listener = (_event: IpcRendererEvent, state: CyrvisVoiceState) =>

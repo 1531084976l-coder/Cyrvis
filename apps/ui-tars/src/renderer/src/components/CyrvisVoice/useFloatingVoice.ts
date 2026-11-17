@@ -166,7 +166,10 @@ export function useFloatingVoice() {
         setTranscript(text);
         setTranscriptFinal(final);
         if (final) {
-          appendEntry('user', text);
+          setThinking(false);
+          if (text.trim()) {
+            appendEntry('user', text);
+          }
         }
       }),
       window.electron.voice.onAssistantText(({ text, final }) => {
@@ -185,6 +188,12 @@ export function useFloatingVoice() {
         setThinking(false);
         setError(null);
       }),
+      window.electron.voice.onError(({ message }) => {
+        setThinking(false);
+        setPlaybackActive(false);
+        setError(message);
+        appendEntry('error', message);
+      }),
       window.electron.voice.onThinking(() => {
         setThinking(true);
       }),
@@ -196,6 +205,7 @@ export function useFloatingVoice() {
         setPlaybackActive(false);
       }),
       window.electron.voice.onResponseDone(() => {
+        setThinking(false);
         setPlaybackActive(false);
       }),
       window.electron.voice.onWake(() => {
