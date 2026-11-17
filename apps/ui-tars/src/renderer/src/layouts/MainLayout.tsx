@@ -2,7 +2,6 @@ import { Outlet } from 'react-router';
 import { AppSidebar } from '@/renderer/src/components/SideBar/app-sidebar';
 import { SidebarInset, SidebarProvider } from '@renderer/components/ui/sidebar';
 import { CyrvisVoiceBar } from '@renderer/components/CyrvisVoice/CyrvisVoiceBar';
-import { FollowUpDialog } from '@renderer/components/Proactivity/FollowUpDialog';
 
 export function MainLayout() {
   return (
@@ -15,7 +14,6 @@ export function MainLayout() {
         <Outlet />
       </SidebarInset>
       <CyrvisVoiceBar />
-      <FollowUpDialog />
     </SidebarProvider>
   );
 }

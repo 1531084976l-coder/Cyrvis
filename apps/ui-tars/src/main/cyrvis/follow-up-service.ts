@@ -2,7 +2,7 @@
  * Copyright (c) 2025 Bytedance, Inc. and its affiliates.
  * SPDX-License-Identifier: Apache-2.0
  */
-import { app, BrowserWindow, ipcMain, powerMonitor } from 'electron';
+import { app, ipcMain, powerMonitor } from 'electron';
 import ElectronStore from 'electron-store';
 import { execFile, type ChildProcess } from 'node:child_process';
 
@@ -190,7 +190,6 @@ const enrichAndSpeak = async (prompt: FollowUpPrompt): Promise<void> => {
     greeting: weather ? `${prompt.greeting}${weather}` : prompt.greeting,
   };
   followUpStore.set('pending', enriched);
-  broadcast(enriched);
 
   const action =
     prompt.reason === 'idle'
@@ -198,29 +197,12 @@ const enrichAndSpeak = async (prompt: FollowUpPrompt): Promise<void> => {
       : '要继续上次的任务吗？';
   const speech = `${enriched.greeting}${action}`;
   if (!speakProactiveText(speech)) speakLocally(speech);
-};
-
-const broadcast = (prompt: FollowUpPrompt) => {
-  for (const win of BrowserWindow.getAllWindows()) {
-    if (!win.isDestroyed()) {
-      win.webContents.send('cyrvis:follow-up:prompt', prompt);
-    }
-  }
-};
-
-const showMainWindow = () => {
-  const win = BrowserWindow.getAllWindows().find(
-    (item) => item.getTitle() === 'UI-TARS Desktop',
-  );
-  if (!win || win.isDestroyed()) return;
-  if (win.isMinimized()) win.restore();
-  win.show();
-  win.focus();
+  followUpStore.set('pending', null);
 };
 
 export const requestFollowUp = (
   reason: FollowUpReason,
-  options: { force?: boolean; revealWindow?: boolean } = {},
+  options: { force?: boolean } = {},
 ): FollowUpPrompt | null => {
   const now = Date.now();
   const enabled = followUpStore.get('enabled');
@@ -247,8 +229,6 @@ export const requestFollowUp = (
     pending: prompt,
   });
 
-  if (options.revealWindow) showMainWindow();
-  broadcast(prompt);
   void enrichAndSpeak(prompt);
   logger.info('[cyrvis follow-up] prompt', prompt);
   return prompt;
@@ -282,12 +262,8 @@ export const registerFollowUpService = (): void => {
     },
   );
 
-  powerMonitor.on('resume', () =>
-    requestFollowUp('resume', { revealWindow: true }),
-  );
-  powerMonitor.on('unlock-screen', () =>
-    requestFollowUp('unlock', { revealWindow: true }),
-  );
+  powerMonitor.on('resume', () => requestFollowUp('resume'));
+  powerMonitor.on('unlock-screen', () => requestFollowUp('unlock'));
 
   // Treat a lack of keyboard/mouse activity as a short pause in the user's
   // workflow. Only prompt once per idle episode and never stack dialogs.
@@ -301,7 +277,6 @@ export const registerFollowUpService = (): void => {
 
     const prompt = requestFollowUp('idle', {
       force: true,
-      revealWindow: true,
     });
     if (prompt) idleSuggestionShown = true;
   }, 1000);
