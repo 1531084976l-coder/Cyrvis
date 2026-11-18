@@ -22,7 +22,7 @@ export const CYRVIS_VOICE_TOOLS: QwenToolDefinition[] = [
     function: {
       name: 'start_gui_task',
       description:
-        'Start a GUI task on the user computer. Only call this when the user explicitly asks to open/close an app, control a browser, search, click, type, save a file, or otherwise operate the desktop. Never call for greetings, thanks, identity questions, or chit-chat.',
+        'Start a GUI task on the user computer. Only call this when the user explicitly asks to open/close an app, control a browser, click, type, save a file, or otherwise operate the desktop. For search/information needs, call search_web first. Never call for greetings, thanks, identity questions, or chit-chat.',
       parameters: {
         type: 'object',
         properties: {
@@ -107,6 +107,92 @@ export const CYRVIS_VOICE_TOOLS: QwenToolDefinition[] = [
           },
         },
         required: ['text'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'search_web',
+      description:
+        'Open a web search directly in the platform browser (Bing on Windows, Safari on macOS). Use this for ANY web information need — prices, flights/hotels, weather, news, places, reviews, recommendations, comparisons, tutorials, policies — even when the user does not say "search" (e.g. "我要去巴黎的机票", "这个耳机多少钱", "最近有什么新闻"). Do NOT use it for local desktop/file/app actions. If the user also wants you to read, compare, or click the results, set task_instruction so the GUI agent continues after the page opens.',
+      parameters: {
+        type: 'object',
+        properties: {
+          query: {
+            type: 'string',
+            description: 'The search query, e.g. "去巴黎的机票".',
+          },
+          engine: {
+            type: 'string',
+            enum: ['bing', 'baidu', 'google'],
+            description:
+              'Search engine; default is the platform default (Bing on Windows, Google on macOS).',
+          },
+          site: {
+            type: 'string',
+            description:
+              'Optional site filter, e.g. "ctrip.com" or "taobao.com". The query becomes "<query> site:<site>".',
+          },
+          task_instruction: {
+            type: 'string',
+            description:
+              'Optional GUI task to start after the results page opens, e.g. "查看携程的机票结果并告诉我前三个选项". Only include when the user wants page interaction.',
+          },
+        },
+        required: ['query'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'open_url',
+      description:
+        'Open an http/https URL directly in the default browser. Use this instead of GUI clicking when the user gives a URL or a known page to open. Optional task_instruction starts a GUI task after the page opens.',
+      parameters: {
+        type: 'object',
+        properties: {
+          url: {
+            type: 'string',
+            description: 'Full http/https URL to open.',
+          },
+          task_instruction: {
+            type: 'string',
+            description:
+              'Optional GUI task to start after the page opens, e.g. "在页面中查看搜索结果".',
+          },
+        },
+        required: ['url'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'open_app',
+      description:
+        'Open an allowlisted desktop app faster than GUI clicking. Use for opening VS Code, Chrome, Explorer, or Notepad. If the user wants work inside the app, set task_instruction so the GUI agent continues after it opens.',
+      parameters: {
+        type: 'object',
+        properties: {
+          app: {
+            type: 'string',
+            enum: ['vscode', 'chrome', 'explorer', 'notepad'],
+            description: 'Allowlisted application to open.',
+          },
+          target: {
+            type: 'string',
+            description:
+              'Optional file/folder path or URL to open with the app.',
+          },
+          task_instruction: {
+            type: 'string',
+            description:
+              'Optional GUI task to start after the app opens, e.g. "在 VS Code 中打开 main.ts 并修改端口".',
+          },
+        },
+        required: ['app'],
       },
     },
   },

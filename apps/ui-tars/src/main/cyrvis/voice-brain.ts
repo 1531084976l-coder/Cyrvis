@@ -4,8 +4,10 @@
  */
 import type { CyrvisController } from './controller';
 import { TaskBusyError } from './controller';
+import type { AllowedApp, SearchEngine } from './desktop-actions';
 import { classifyIntent, isExplicitChat } from './intent-gate';
 import { ProactivityPolicy, type ProactivityOptions } from './proactivity';
+import { detectSearchIntent } from './search-intent';
 import type { ControllerEvent } from './types';
 import type { CyrvisVoiceState } from '@shared/cyrvis';
 import type {
@@ -65,6 +67,16 @@ const normalizeTranscriptDedupeKey = (text: string) =>
     .normalize('NFKC')
     .toLowerCase()
     .replace(/[\p{P}\p{S}\s]/gu, '');
+
+/**
+ * A search intent that also needs real page interaction (click a result,
+ * book a flight, fill a form) is still a GUI task. Plain lookup/search must
+ * go through search_web instead.
+ */
+const GUI_INTERACTION_PATTERNS: RegExp[] = [
+  /(点击|点一下|双击|选择|预订|下单|填写|登录|滚动|比较|对比|查看页面|截图|截屏|加入购物车|支付|购买|提交|确认订单)/,
+  /\b(click|select|book|order|fill|login|scroll|compare|screenshot|add to cart|pay|purchase|submit)\b/i,
+];
 
 /**
  * The conversational brain.
@@ -398,6 +410,17 @@ export class VoiceBrain {
     }
 
     this.lastUserText = text;
+    const searchIntent = detectSearchIntent(text);
+    if (searchIntent.isSearch) {
+      console.log(
+        '[cyrvis search] intent',
+        JSON.stringify({
+          query: searchIntent.query,
+          confidence: searchIntent.confidence,
+          reason: searchIntent.reason,
+        }),
+      );
+    }
 
     // Safety-critical: stop/pause must act even if the voice model forgets to
     // call the tool (observed in real testing: it said "paused" but the GUI
@@ -433,7 +456,9 @@ export class VoiceBrain {
       const decision = classifyIntent(text);
       const autoWake =
         this.options.autoWakeOnTask !== false &&
-        (decision.kind === 'task' || decision.kind === 'control');
+        (decision.kind === 'task' ||
+          decision.kind === 'control' ||
+          searchIntent.confidence === 'high');
 
       if (this.isWakePhrase(text) || autoWake) {
         this.wake();
@@ -448,6 +473,57 @@ export class VoiceBrain {
 
     this.resetAwakeTimer();
     this.notifyState();
+  }
+
+  private async finishFastOpen(
+    call: VoiceToolCallWithId,
+    target: string,
+    taskInstruction: unknown,
+    delayMs: number,
+  ): Promise<void> {
+    const instruction =
+      typeof taskInstruction === 'string' ? taskInstruction.trim() : '';
+    if (!instruction || isExplicitChat(instruction)) {
+      this.provider.sendToolResult(
+        call.callId,
+        JSON.stringify({
+          ok: true,
+          status: 'opened',
+          target,
+          message:
+            'OPENED. The target is opening/loading. If the user asked you to read, compare, or click results, call start_gui_task with a concrete instruction. Do not claim results yet.',
+        }),
+      );
+      return;
+    }
+
+    await new Promise((resolve) => setTimeout(resolve, delayMs));
+    try {
+      const task = this.controller.startTask(instruction, 'voice');
+      this.provider.sendToolResult(
+        call.callId,
+        JSON.stringify({
+          ok: true,
+          status: 'started',
+          target,
+          task_id: task.taskId,
+          message:
+            'TASK_STARTED. The GUI agent is working on the opened target. Do NOT claim completion; wait for task_done/task_failed.',
+        }),
+      );
+    } catch (error) {
+      if (error instanceof TaskBusyError) {
+        this.provider.sendToolResult(
+          call.callId,
+          'TASK_BUSY: a GUI task is already running. Ask the user whether to cancel it before starting a new one.',
+        );
+        return;
+      }
+      this.provider.sendToolResult(
+        call.callId,
+        `ERROR: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
   }
 
   private async handleToolCall(call: VoiceToolCallWithId): Promise<void> {
@@ -495,6 +571,31 @@ export class VoiceBrain {
           return;
         }
 
+        // The model sometimes routes "我要去巴黎的机票" to the GUI agent and
+        // slowly opens a homepage. Pure lookup/search should use search_web.
+        // Allow the GUI path when the instruction itself needs interaction.
+        const searchIntent = this.lastUserText
+          ? detectSearchIntent(this.lastUserText)
+          : null;
+        const needsGuiInteraction = GUI_INTERACTION_PATTERNS.some((pattern) =>
+          pattern.test(instruction),
+        );
+        if (searchIntent?.confidence === 'high' && !needsGuiInteraction) {
+          this.provider.sendToolResult(
+            call.callId,
+            JSON.stringify({
+              ok: false,
+              status: 'use_search_tool',
+              query: searchIntent.query,
+              message:
+                `USE_SEARCH_WEB: "${this.lastUserText}" is a web information need, not a GUI automation task. ` +
+                `Call search_web with query "${searchIntent.query}" instead. ` +
+                'If the user also wants to read/compare/click the results, pass a task_instruction to search_web.',
+            }),
+          );
+          return;
+        }
+
         try {
           const task = this.controller.startTask(instruction, 'voice');
           this.provider.sendToolResult(
@@ -516,6 +617,104 @@ export class VoiceBrain {
             return;
           }
           throw error;
+        }
+        break;
+      }
+      case 'search_web': {
+        const { buildSearchUrl, defaultSearchEngine, openSearch } =
+          await import('./desktop-actions');
+        const query = String(call.args.query || '').trim();
+        if (!query) {
+          this.provider.sendToolResult(
+            call.callId,
+            'ERROR: search_web requires a query.',
+          );
+          return;
+        }
+        const engineValue = String(call.args.engine || defaultSearchEngine());
+        const engine: SearchEngine =
+          engineValue === 'baidu' || engineValue === 'google'
+            ? (engineValue as SearchEngine)
+            : 'bing';
+        const site =
+          typeof call.args.site === 'string' ? call.args.site : undefined;
+        try {
+          const url = buildSearchUrl(query, engine, site);
+          await openSearch(url);
+          await this.finishFastOpen(
+            call,
+            url,
+            call.args.task_instruction,
+            1200,
+          );
+        } catch (error) {
+          this.provider.sendToolResult(
+            call.callId,
+            `ERROR: ${error instanceof Error ? error.message : String(error)}`,
+          );
+        }
+        break;
+      }
+      case 'open_url': {
+        const { openUrl } = await import('./desktop-actions');
+        const url = String(call.args.url || '').trim();
+        if (!url) {
+          this.provider.sendToolResult(
+            call.callId,
+            'ERROR: open_url requires a URL.',
+          );
+          return;
+        }
+        try {
+          const opened = await openUrl(url);
+          await this.finishFastOpen(
+            call,
+            opened,
+            call.args.task_instruction,
+            1200,
+          );
+        } catch (error) {
+          this.provider.sendToolResult(
+            call.callId,
+            `ERROR: ${error instanceof Error ? error.message : String(error)}`,
+          );
+        }
+        break;
+      }
+      case 'open_app': {
+        const { openApp } = await import('./desktop-actions');
+        const appValue = String(call.args.app || '');
+        const allowedApps: AllowedApp[] = [
+          'vscode',
+          'chrome',
+          'explorer',
+          'notepad',
+        ];
+        if (!allowedApps.includes(appValue as AllowedApp)) {
+          this.provider.sendToolResult(
+            call.callId,
+            `ERROR: unsupported app. Allowed: ${allowedApps.join(', ')}.`,
+          );
+          return;
+        }
+        const target =
+          typeof call.args.target === 'string' ? call.args.target : undefined;
+        try {
+          const result = await openApp(appValue as AllowedApp, target);
+          const label = result.target
+            ? `${result.app}:${result.target}`
+            : result.app;
+          await this.finishFastOpen(
+            call,
+            label,
+            call.args.task_instruction,
+            1800,
+          );
+        } catch (error) {
+          this.provider.sendToolResult(
+            call.callId,
+            `ERROR: ${error instanceof Error ? error.message : String(error)}`,
+          );
         }
         break;
       }

@@ -210,6 +210,16 @@ describe('VoiceBrain', () => {
     expect(brain.getState().lastUserText).toContain('记事本');
   });
 
+  it('auto-wakes on a clear search need without the wake word', async () => {
+    const { brain, provider } = setup();
+    await brain.start();
+
+    provider.emitTranscript('我要去巴黎的机票', true);
+
+    expect(brain.getState().awake).toBe(true);
+    expect(brain.getState().lastUserText).toContain('巴黎');
+  });
+
   it('drops audio while asleep and plays it after waking', async () => {
     const { brain, provider, audioOut } = setup();
     await brain.start();
@@ -236,6 +246,23 @@ describe('VoiceBrain', () => {
 
     expect(adapter.instruction).toBe('');
     expect(provider.toolResults[0].output).toContain('REJECTED');
+  });
+
+  it('redirects a pure search request from start_gui_task to search_web', async () => {
+    const { brain, provider, adapter } = setup();
+    await brain.start();
+    provider.emitTranscript('我要去巴黎的机票', true);
+
+    provider.emitToolCall({
+      name: 'start_gui_task',
+      args: { instruction: '打开浏览器搜索去巴黎的机票' },
+      callId: 'call-search-redirect',
+    });
+    await flush();
+
+    expect(adapter.instruction).toBe('');
+    expect(provider.toolResults[0].output).toContain('USE_SEARCH_WEB');
+    expect(provider.toolResults[0].output).toContain('去巴黎的机票');
   });
 
   it('dispatches a real GUI task and returns a task id', async () => {
@@ -266,7 +293,8 @@ describe('VoiceBrain', () => {
     provider.emitToolCall({
       name: 'start_gui_task',
       args: {
-        instruction: '打开携程，搜索从当前城市到巴黎的最便宜机票。',
+        instruction:
+          '打开携程，点击机票搜索，查看从当前城市到巴黎的最便宜机票。',
       },
       callId: 'call-paris',
     });

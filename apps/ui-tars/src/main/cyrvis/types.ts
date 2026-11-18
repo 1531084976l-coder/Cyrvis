@@ -53,6 +53,27 @@ export type VoiceToolCall =
   | { name: 'get_gui_status'; args: Record<string, never> }
   | { name: 'remember_fact'; args: { text: string } }
   | {
+      name: 'search_web';
+      args: {
+        query: string;
+        engine?: 'bing' | 'baidu' | 'google';
+        site?: string;
+        task_instruction?: string;
+      };
+    }
+  | {
+      name: 'open_url';
+      args: { url: string; task_instruction?: string };
+    }
+  | {
+      name: 'open_app';
+      args: {
+        app: 'vscode' | 'chrome' | 'explorer' | 'notepad';
+        target?: string;
+        task_instruction?: string;
+      };
+    }
+  | {
       name: 'confirm_action';
       args: { task_id: string; approved: boolean };
     };
