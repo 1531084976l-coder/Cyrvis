@@ -148,15 +148,7 @@ export class QwenOmniProvider implements VoiceProvider {
 
     // Never keep an old socket alive: two live sessions would deliver the same
     // assistant audio twice (heard as two overlapping AI voices).
-    if (this.ws) {
-      try {
-        this.ws.removeAllListeners();
-        this.ws.close();
-      } catch {
-        // already closed
-      }
-      this.ws = null;
-    }
+    this.disposeSocket(this.ws);
     this.connected = false;
     this.localSpeechActive = false;
     this.bufferedAudioMs = 0;
@@ -531,8 +523,43 @@ export class QwenOmniProvider implements VoiceProvider {
     this.playbackBusy = false;
     this.clearToolResultFallback();
     this.clearPlaybackFallback();
-    this.ws?.close();
-    this.ws = null;
+    this.disposeSocket(this.ws);
+  }
+
+  /**
+   * Dispose a socket without letting ws emit an unhandled error. Calling
+   * close() while the handshake is still in progress makes ws emit
+   * "WebSocket was closed before the connection was established". Electron
+   * treats that as an uncaught main-process exception if listeners have
+   * already been removed, so keep a no-op error listener and terminate the
+   * in-flight handshake instead.
+   */
+  private disposeSocket(ws: WebSocket | null): void {
+    if (!ws) {
+      return;
+    }
+
+    ws.removeAllListeners();
+    ws.on('error', () => {
+      // Expected while an in-flight handshake is being cancelled.
+    });
+
+    try {
+      // ws v8's bundled typings omit the static CONNECTING constant (0).
+      if (ws.readyState === 0) {
+        ws.terminate();
+      } else if (ws.readyState === WebSocket.OPEN) {
+        ws.close();
+      } else if (ws.readyState !== WebSocket.CLOSED) {
+        ws.terminate();
+      }
+    } catch {
+      // The peer may have closed the socket concurrently.
+    }
+
+    if (this.ws === ws) {
+      this.ws = null;
+    }
   }
 
   private scheduleReconnect(): void {
