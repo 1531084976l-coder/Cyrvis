@@ -98,7 +98,7 @@ export function FollowUpDialog() {
           </DialogTitle>
           <DialogDescription>
             {prompt.reason === 'idle'
-              ? '检测到 15 秒没有操作。我可以帮你回到最近的工作，并从上次停下的位置继续。'
+              ? '检测到 10 秒没有操作。我可以帮你回到最近的工作，并从上次停下的位置继续。'
               : '我找到了最近一次对话，可以帮你从上次停下的位置继续。'}
           </DialogDescription>
         </DialogHeader>

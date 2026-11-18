@@ -35,7 +35,7 @@ interface FollowUpState {
 
 const PROMPT_GAP_MS = 30 * 60 * 1000;
 const DEFAULT_SNOOZE_MS = 30 * 60 * 1000;
-const IDLE_SUGGESTION_SECONDS = 15;
+const IDLE_SUGGESTION_SECONDS = 10;
 const LIFECYCLE_DEDUPE_MS = 10_000;
 const IDLE_AFTER_GREETING_MS = 60_000;
 
@@ -416,7 +416,7 @@ export const registerFollowUpService = (): void => {
       const sourceAt = Math.max(lastUserAt, lastActivityAt);
 
       // Voice activity does not reset macOS's keyboard/mouse idle clock. Start
-      // the 15-second window from the latest conversation/task event as well.
+      // the 10-second window from the latest conversation/task event as well.
       if (
         sourceAt > 0 &&
         Date.now() - sourceAt < IDLE_SUGGESTION_SECONDS * 1000
@@ -434,7 +434,7 @@ export const registerFollowUpService = (): void => {
 
       // Do not follow a launch/wake greeting with another generic prompt. A new
       // user turn or task event bypasses this grace period and gets its normal
-      // 15-second contextual suggestion.
+      // 10-second contextual suggestion.
       if (
         Date.now() - lastLifecyclePromptAt < IDLE_AFTER_GREETING_MS &&
         sourceAt <= lastLifecyclePromptAt
