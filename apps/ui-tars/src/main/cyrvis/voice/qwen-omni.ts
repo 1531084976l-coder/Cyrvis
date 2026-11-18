@@ -417,10 +417,7 @@ export class QwenOmniProvider implements VoiceProvider {
         output,
       },
     });
-    this.send({
-      event_id: eventId('event_response'),
-      type: 'response.create',
-    });
+    this.createResponse();
     console.log('[cyrvis provider] tool result sent');
   }
 
@@ -428,17 +425,15 @@ export class QwenOmniProvider implements VoiceProvider {
     this.proactivePending = true;
     this.awaitingResponse = true;
     this.activeResponseId = null;
+    const instructions = `${this.instructions}\n\n[系统主动播报] 现在请只用一句自然、简短的中文对用户说：${text}`;
     this.send({
       event_id: eventId('event_proactive_update'),
       type: 'session.update',
-      session: {
-        instructions: `${this.instructions}\n\n[系统主动播报] 现在请只用一句自然、简短的中文对用户说：${text}`,
-      },
+      session: { instructions },
     });
-    this.send({
-      event_id: eventId('event_proactive_response'),
-      type: 'response.create',
-    });
+    // The server rejects an empty response.create even when the session
+    // already has instructions. Attach them to this response as well.
+    this.createResponse(instructions);
     console.log('[cyrvis provider] proactive speech sent');
   }
 
@@ -655,6 +650,13 @@ export class QwenOmniProvider implements VoiceProvider {
         this.activeResponseId =
           typeof event.response_id === 'string' ? event.response_id : null;
         this.responseAudioBytes = 0;
+        // Commit has been accepted. Drop the buffer now so the next utterance
+        // does not replay the previous one, without racing response.create.
+        this.bufferedAudioMs = 0;
+        this.send({
+          event_id: eventId('event_clear_after_commit'),
+          type: 'input_audio_buffer.clear',
+        });
         console.log('[cyrvis provider] response created', {
           responseId: this.activeResponseId,
         });
@@ -756,6 +758,12 @@ export class QwenOmniProvider implements VoiceProvider {
       }
       case 'error': {
         const message = JSON.stringify(event.error || event).slice(0, 1000);
+        // A rejected response.create never emits response.created. Leaving
+        // awaitingResponse set made every later utterance get dropped.
+        if (!this.responseActive) {
+          this.awaitingResponse = false;
+          this.proactivePending = false;
+        }
         if (!this.cancelRequested) {
           this.callbacks.onError?.(new Error(message));
         }
@@ -917,20 +925,18 @@ export class QwenOmniProvider implements VoiceProvider {
       event_id: eventId('event_commit'),
       type: 'input_audio_buffer.commit',
     });
-    // Qwen keeps the committed audio in its input buffer unless explicitly
-    // cleared. Without this, the next commit contains the previous utterance
-    // again and the ASR transcript repeats ("Hello, Savage. Hello, Savage."),
-    // which produces a second reply. Clear immediately after commit.
-    this.send({
-      event_id: eventId('event_clear_after_commit'),
-      type: 'input_audio_buffer.clear',
-    });
+    this.createResponse();
+    console.log('[cyrvis provider] commit + response.create sent');
+    this.callbacks.onUtteranceCommitted?.();
+  }
+
+  private createResponse(instructions?: string): void {
+    const text = (instructions || this.instructions).trim();
     this.send({
       event_id: eventId('event_response'),
       type: 'response.create',
+      response: text ? { instructions: text } : {},
     });
-    console.log('[cyrvis provider] commit + clear + response.create sent');
-    this.callbacks.onUtteranceCommitted?.();
   }
 
   private sendSessionUpdate(): void {

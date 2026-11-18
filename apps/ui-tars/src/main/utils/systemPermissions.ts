@@ -23,8 +23,10 @@ export const ensurePermissions = ({
     };
   }
 
+  const screenStatus = permissions.getAuthStatus('screen');
+  const mediaStatus = systemPreferences.getMediaAccessStatus?.('screen');
   const hasScreenRecordingPermission =
-    permissions.getAuthStatus('screen') === 'authorized';
+    screenStatus === 'authorized' || mediaStatus === 'granted';
   const hasAccessibilityPermission =
     systemPreferences.isTrustedAccessibilityClient(request);
 
@@ -42,6 +44,10 @@ export const ensurePermissions = ({
   logger.info(
     '[ensurePermissions] hasScreenRecordingPermission',
     hasScreenRecordingPermission,
+    'screenStatus',
+    screenStatus,
+    'mediaStatus',
+    mediaStatus,
     'hasAccessibilityPermission',
     hasAccessibilityPermission,
   );
