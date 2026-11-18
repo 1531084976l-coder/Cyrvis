@@ -32,7 +32,9 @@ import {
 let voiceOwner: symbol | null = null;
 
 const BARGE_CONFIRMATION_FRAMES = 3;
-const TTS_BARGE_THRESHOLD = 0.055;
+// AEC double-talk leaves the user's voice around 0.05-0.06 RMS on this
+// hardware. 0.055 sat right on the boundary and caused intermittent misses.
+const TTS_BARGE_THRESHOLD = 0.05;
 const MAX_BARGE_PREROLL_CHUNKS = 8;
 const BARGE_ENDPOINT_SILENCE_MS = MIN_ENDPOINT_SILENCE_MS;
 
@@ -135,6 +137,7 @@ export function useVoiceAudio() {
   const noiseFloorRef = useRef(0.006);
   const speechFramesRef = useRef(0);
   const bargeFramesRef = useRef(0);
+  const lastBargeDiagRef = useRef(0);
 
   settingsRef.current = settings;
 
@@ -302,9 +305,7 @@ export function useVoiceAudio() {
       const merged: Uint8Array[] = [];
       for (const frame of preRoll) {
         merged.push(
-          floatToPcm16(
-            downsamplePcm(frame, captureSampleRateRef.current),
-          ),
+          floatToPcm16(downsamplePcm(frame, captureSampleRateRef.current)),
         );
       }
       if (merged.length) {
@@ -344,6 +345,16 @@ export function useVoiceAudio() {
           TTS_BARGE_THRESHOLD,
           noiseFloorRef.current * 2.5,
         );
+        const nowDiag = Date.now();
+        if (nowDiag - lastBargeDiagRef.current >= 500) {
+          lastBargeDiagRef.current = nowDiag;
+          console.log('[cyrvis] barge diag', {
+            rms: Number(rms.toFixed(4)),
+            threshold: Number(threshold.toFixed(4)),
+            frames: bargeFramesRef.current,
+            floor: Number(noiseFloorRef.current.toFixed(4)),
+          });
+        }
         bargeFramesRef.current =
           rms >= threshold ? bargeFramesRef.current + 1 : 0;
         if (bargeFramesRef.current >= BARGE_CONFIRMATION_FRAMES) {
@@ -354,6 +365,22 @@ export function useVoiceAudio() {
           cancelPlayer();
           window.electron.voice.cancelSpeechOnly();
           beginStreamingUtterance(preRoll);
+        }
+        return;
+      }
+
+      // Omni uses the model's server-side VAD. Send every microphone chunk
+      // while the assistant is silent; gating by the renderer's cascade VAD
+      // truncated utterances before the server could endpoint them.
+      if (settingsRef.current.voiceEngine === 'omni') {
+        pendingPcmRef.current = appendPcm16(
+          pendingPcmRef.current,
+          floatToPcm16(samples),
+        );
+        const { chunks, remainder } = takePcmChunks(pendingPcmRef.current);
+        pendingPcmRef.current = remainder;
+        for (const chunk of chunks) {
+          window.electron.voice.sendAudio(chunk.buffer as ArrayBuffer);
         }
         return;
       }
@@ -391,11 +418,10 @@ export function useVoiceAudio() {
         shouldFinishStreamingUtterance({
           durationMs,
           silenceMs,
-          configuredSilenceMs:
-            bargePendingRef.current
-              ? BARGE_ENDPOINT_SILENCE_MS
-              : settingsRef.current.voiceSilenceTimeoutMs ||
-                MIN_ENDPOINT_SILENCE_MS,
+          configuredSilenceMs: bargePendingRef.current
+            ? BARGE_ENDPOINT_SILENCE_MS
+            : settingsRef.current.voiceSilenceTimeoutMs ||
+              MIN_ENDPOINT_SILENCE_MS,
           transcript: transcriptRef.current,
         })
       ) {
@@ -519,7 +545,9 @@ export function useVoiceAudio() {
     const stream = await navigator.mediaDevices.getUserMedia({
       audio: {
         echoCancellation: true,
-        noiseSuppression: true,
+        // NS attenuates the near-end voice during double-talk on this
+        // hardware; AEC alone keeps the echo below the barge threshold.
+        noiseSuppression: false,
         autoGainControl: true,
         channelCount: 1,
       },
@@ -633,6 +661,12 @@ export function useVoiceAudio() {
         if (settingsRef.current.voiceEngine !== 'omni' || !pcm16.length) {
           return;
         }
+        // Only treat the assistant as speaking once real audio arrives. The
+        // response.created event fires before the model has processed the
+        // user's own utterance, so arming the barge there cancelled responses
+        // while the user was still finishing their sentence.
+        assistantSpeakingRef.current = true;
+        setPlaybackActive(true);
         if (!legacyPlayerRef.current) {
           legacyPlayerRef.current = new WebAudioStreamPlayer(
             finishPlayback,
@@ -649,14 +683,18 @@ export function useVoiceAudio() {
         });
         cancelPlayer();
         playerEpochRef.current += 1;
-        assistantSpeakingRef.current = true;
+        if (settingsRef.current.voiceEngine !== 'omni') {
+          assistantSpeakingRef.current = true;
+        }
         speechDeltaRef.current = '';
         speechDeltaSeenRef.current = false;
         firstAudioPromiseRef.current = new Promise<boolean>((resolve) => {
           resolveFirstAudioRef.current = resolve;
         });
         setThinking(false);
-        setPlaybackActive(true);
+        if (settingsRef.current.voiceEngine !== 'omni') {
+          setPlaybackActive(true);
+        }
         if (settingsRef.current.voiceEngine === 'omni') {
           return;
         }

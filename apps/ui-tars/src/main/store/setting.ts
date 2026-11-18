@@ -91,6 +91,24 @@ export const DEFAULT_SETTING: LocalStore = {
   utioBaseUrl: '',
 };
 
+const SENSITIVE_SETTING_KEY = /(api[-_]?key|token|secret|password)/i;
+
+const redactSettings = (value: unknown): unknown => {
+  if (Array.isArray(value)) {
+    return value.map(redactSettings);
+  }
+  if (value && typeof value === 'object') {
+    const output: Record<string, unknown> = {};
+    for (const [key, entry] of Object.entries(value)) {
+      output[key] = SENSITIVE_SETTING_KEY.test(key)
+        ? '***'
+        : redactSettings(entry);
+    }
+    return output;
+  }
+  return value;
+};
+
 export class SettingStore {
   private static instance: ElectronStore<LocalStore>;
 
@@ -103,7 +121,9 @@ export class SettingStore {
 
       SettingStore.instance.onDidAnyChange((newValue, oldValue) => {
         logger.log(
-          `SettingStore: ${JSON.stringify(oldValue)} changed to ${JSON.stringify(newValue)}`,
+          `SettingStore: ${JSON.stringify(
+            redactSettings(oldValue),
+          )} changed to ${JSON.stringify(redactSettings(newValue))}`,
         );
         // Notify that value updated
         BrowserWindow.getAllWindows().forEach((win) => {

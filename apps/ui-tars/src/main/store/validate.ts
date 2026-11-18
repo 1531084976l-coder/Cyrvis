@@ -59,6 +59,8 @@ export const PresetSchema = z.object({
       'openai-compatible',
       'tenlai-async',
       'qwen-dashscope-streaming',
+      'local-sherpa',
+      'realtime-asr',
     ])
     .optional()
     .transform((value) => value as VoiceSttProvider | undefined),

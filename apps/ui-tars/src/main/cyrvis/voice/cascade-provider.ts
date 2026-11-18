@@ -16,7 +16,9 @@ import {
 } from '@shared/voice';
 
 import { CascadeConversationClient } from './cascade-conversation';
+import { transcribeLocal } from './local-asr';
 import { transcribeOpenAiCompatible } from './openai-asr';
+import { transcribeRealtime } from './realtime-asr';
 import type {
   InteractiveVoiceProvider,
   VoiceProviderCallbacks,
@@ -291,6 +293,10 @@ export class CascadeVoiceProvider implements InteractiveVoiceProvider {
         await this.asrSendChain;
         const result = await this.asr.finish(sessionId);
         text = (result.text || this.lastPartialText).trim();
+      } else if (this.sttProvider === 'local-sherpa') {
+        text = (await transcribeLocal(this.utteranceAudio)).trim();
+      } else if (this.sttProvider === 'realtime-asr') {
+        text = (await transcribeRealtime(this.utteranceAudio)).trim();
       } else {
         if (this.sttProvider === 'tenlai-async') {
           const settings = SettingStore.getStore();
@@ -309,6 +315,7 @@ export class CascadeVoiceProvider implements InteractiveVoiceProvider {
           const result = await transcribeWithTenlai(
             { audioBase64: pcm.toString('base64') },
             {
+              // secretlint-disable-next-line @secretlint/secretlint-rule-pattern
               apiKey: settings.voiceSttApiKey?.trim() || '',
               baseUrl: settings.voiceSttBaseUrl,
               model: settings.voiceSttModel,

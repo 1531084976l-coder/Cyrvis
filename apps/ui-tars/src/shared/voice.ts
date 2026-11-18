@@ -24,12 +24,16 @@ export type VoiceSttProvider =
   | 'auto'
   | 'openai-compatible'
   | 'tenlai-async'
-  | 'qwen-dashscope-streaming';
+  | 'qwen-dashscope-streaming'
+  | 'local-sherpa'
+  | 'realtime-asr';
 
 export type ResolvedVoiceSttProvider =
   | 'openai-compatible'
   | 'tenlai-async'
-  | 'qwen-dashscope-streaming';
+  | 'qwen-dashscope-streaming'
+  | 'local-sherpa'
+  | 'realtime-asr';
 
 export type VoiceTtsProvider = 'auto' | 'breeze-local' | 'qwen-tts-realtime';
 
@@ -50,7 +54,9 @@ export const resolveVoiceSttProvider = (
   if (
     provider === 'openai-compatible' ||
     provider === 'tenlai-async' ||
-    provider === 'qwen-dashscope-streaming'
+    provider === 'qwen-dashscope-streaming' ||
+    provider === 'local-sherpa' ||
+    provider === 'realtime-asr'
   ) {
     return provider;
   }

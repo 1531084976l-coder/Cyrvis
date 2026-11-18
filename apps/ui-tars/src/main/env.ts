@@ -38,8 +38,7 @@ const parseBoolean = (value: string | undefined, fallback: boolean) => {
 };
 
 export const voiceEngine =
-  (process.env.CYRVIS_VOICE_ENGINE as 'cascade' | 'omni' | undefined) ||
-  'cascade';
+  (process.env.CYRVIS_VOICE_ENGINE as 'cascade' | 'omni' | undefined) || 'omni';
 export const voiceEnabled = parseBoolean(process.env.VOICE_ENABLED, true);
 export const voiceRequireWakeWord = parseBoolean(
   process.env.VOICE_REQUIRE_WAKE_WORD,
@@ -57,7 +56,10 @@ export const voiceSilenceTimeoutMs = Number(
 export const voiceSttProvider = process.env.VOICE_STT_PROVIDER as
   | 'auto'
   | 'openai-compatible'
+  | 'tenlai-async'
   | 'qwen-dashscope-streaming'
+  | 'local-sherpa'
+  | 'realtime-asr'
   | undefined;
 export const voiceSttBaseUrl = process.env.VOICE_STT_BASE_URL;
 export const voiceSttApiKey =

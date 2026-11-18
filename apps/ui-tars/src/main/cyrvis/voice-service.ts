@@ -14,6 +14,7 @@ import { logger } from '@main/logger';
 import { SettingStore } from '@main/store/setting';
 import { breezeTtsService } from '@main/services/breezeTts';
 import { qwenTtsRealtimeService } from '@main/services/qwenTtsRealtime';
+import { localTtsService } from './voice/local-tts';
 import {
   describeControllerEvent,
   describeVoiceToolCall,
@@ -43,6 +44,13 @@ interface VoiceService {
 
 let service: VoiceService | null = null;
 let selectedVoiceEngine: 'cascade' | 'omni' = env.voiceEngine;
+// Hybrid mode: the main Renderer owns the microphone (and its AEC reference),
+// so the hidden capture window must not feed a second copy of the same audio
+// into the omni provider.
+const rendererCapture =
+  selectedVoiceEngine === 'omni'
+    ? process.env.CYRVIS_RENDERER_CAPTURE !== '0'
+    : process.env.CYRVIS_RENDERER_CAPTURE === '1';
 let captureService: CaptureService | null = null;
 let captureReady = false;
 let captureGeneration = 0;
@@ -888,6 +896,9 @@ const scheduleCaptureRetry = (message: string) => {
 };
 
 const startCapture = async (resetRetries = false): Promise<void> => {
+  if (rendererCapture) {
+    return;
+  }
   if (resetRetries) {
     captureRetryAttempts = 0;
     clearCaptureRetry();
@@ -1150,17 +1161,19 @@ const registerVoiceIpc = () => {
     },
   );
 
-  ipcMain.handle('qwen-tts:start', (_event, input) =>
-    qwenTtsRealtimeService.start(input),
-  );
+  const ttsService =
+    process.env.CYRVIS_TTS_LOCAL === '1'
+      ? (localTtsService as unknown as typeof qwenTtsRealtimeService)
+      : qwenTtsRealtimeService;
+  ipcMain.handle('qwen-tts:start', (_event, input) => ttsService.start(input));
   ipcMain.handle('qwen-tts:append', (_event, input) =>
-    qwenTtsRealtimeService.append(input),
+    ttsService.append(input),
   );
   ipcMain.handle('qwen-tts:finish', (_event, input) =>
-    qwenTtsRealtimeService.finish(input.sessionId),
+    ttsService.finish(input.sessionId),
   );
   ipcMain.handle('qwen-tts:cancel', (_event, input) =>
-    qwenTtsRealtimeService.cancel(input.sessionId),
+    ttsService.cancel(input.sessionId),
   );
   ipcMain.handle('qwen-tts:prepare-voice', (_event, input) =>
     qwenTtsRealtimeService.ensureVoice(input),
@@ -1289,7 +1302,7 @@ const registerVoiceIpc = () => {
       echoCancellation: false,
     });
     broadcast('cyrvis:voice:audio-mode', { mode: audioMode });
-    if (changed && selectedVoiceEngine === 'omni') {
+    if (changed && selectedVoiceEngine === 'omni' && !rendererCapture) {
       // Bluetooth profile/A2DP switches briefly drop the HFP microphone.
       await new Promise((resolve) => setTimeout(resolve, 500));
       try {
@@ -1326,7 +1339,7 @@ const registerVoiceIpc = () => {
   });
 
   ipcMain.handle('cyrvis:voice:restart-capture', async () => {
-    if (selectedVoiceEngine === 'cascade') {
+    if (selectedVoiceEngine === 'cascade' || rendererCapture) {
       return { ok: true, rendererOwned: true };
     }
     try {

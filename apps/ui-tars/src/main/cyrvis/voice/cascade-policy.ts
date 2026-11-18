@@ -10,12 +10,15 @@ export const shouldUseCascadeTools = (text: string) =>
   TOOL_TRIGGER_PATTERN.test(text);
 
 export const shouldDisableThinking = (baseURL: string, model: string) => {
+  const normalized = model.trim().toLowerCase();
+  // Qwen3 plus models default to reasoning, which added 30-48s before the
+  // first voice token in the cascade path. Voice replies need a direct answer.
+  if (normalized.startsWith('qwen3') || normalized.startsWith('deepseek-')) {
+    return true;
+  }
   try {
-    return (
-      new URL(baseURL).hostname.endsWith('deepseek.com') ||
-      model.trim().toLowerCase().startsWith('deepseek-')
-    );
+    return new URL(baseURL).hostname.endsWith('deepseek.com');
   } catch {
-    return model.trim().toLowerCase().startsWith('deepseek-');
+    return false;
   }
 };
