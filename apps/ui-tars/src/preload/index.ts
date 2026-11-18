@@ -169,6 +169,10 @@ const electronHandler = {
       ) as Promise<TaskSnapshot | null>,
     sendAudio: (buffer: ArrayBuffer) =>
       ipcRenderer.send('cyrvis:voice:audio', buffer),
+    // KWS-only path: the hybrid omni mode streams mic PCM here while the
+    // assistant is speaking so stop words keep their local fast path.
+    sendKeywordAudio: (buffer: ArrayBuffer) =>
+      ipcRenderer.send('cyrvis:voice:keyword-audio', buffer),
     beginUtterance: () => ipcRenderer.send('cyrvis:voice:begin-utterance'),
     finishUtterance: () => ipcRenderer.send('cyrvis:voice:finish-utterance'),
     cancelUtterance: () => ipcRenderer.send('cyrvis:voice:cancel-utterance'),
@@ -178,8 +182,7 @@ const electronHandler = {
     notifyPlaybackStopped: (info?: { queuedMs?: number }) =>
       ipcRenderer.send('cyrvis:voice:playback-stopped', info),
     bargeIn: () => ipcRenderer.send('cyrvis:voice:barge-in'),
-    cancelSpeechOnly: () =>
-      ipcRenderer.send('cyrvis:voice:cancel-speech-only'),
+    cancelSpeechOnly: () => ipcRenderer.send('cyrvis:voice:cancel-speech-only'),
     forceAwake: () => ipcRenderer.send('cyrvis:voice:force-awake'),
     sleep: () => ipcRenderer.send('cyrvis:voice:sleep'),
     onAudio: (callback: (pcm16: Int16Array) => void) => {
@@ -275,8 +278,7 @@ const electronHandler = {
         payload: { message: string },
       ) => callback(payload);
       ipcRenderer.on('cyrvis:voice:error', listener);
-      return () =>
-        ipcRenderer.removeListener('cyrvis:voice:error', listener);
+      return () => ipcRenderer.removeListener('cyrvis:voice:error', listener);
     },
     onState: (callback: (state: CyrvisVoiceState) => void) => {
       const listener = (_event: IpcRendererEvent, state: CyrvisVoiceState) =>

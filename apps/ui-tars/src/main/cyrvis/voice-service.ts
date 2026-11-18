@@ -316,6 +316,30 @@ const recentForVerification = (): Int16Array[] => {
   return total >= 8000 ? capturePreroll : keywordPreroll;
 };
 
+const feedHybridKeywordAudio = (pcm16: Int16Array): void => {
+  if (!assistantPlaybackActive || !keywordGate?.available) {
+    return;
+  }
+  keywordPreroll.push(pcm16.slice());
+  if (keywordPreroll.length > 50) {
+    keywordPreroll.shift();
+  }
+  const speakerPath = (speakerOutputMode || externalOutput) && !energyOnlyBarge;
+  const ttsContainsStop = /停|暂停|停止/.test(lastAssistantText);
+  const result = keywordGate.feed(pcm16, keywordPreroll.slice(), speakerPath, {
+    ttsContainsStop,
+    // The hybrid renderer owns TTS playback, so the main process has no
+    // aligned playback reference. Direct stop words do not need it; when
+    // the assistant is saying a stop word, the absolute voiceprint gate
+    // still applies.
+    reference: null,
+  });
+  if (result === 'rejected') {
+    keywordRejectUntil = Date.now() + 600;
+    speakerCandidateMs = 0;
+  }
+};
+
 const recentReference = (): Float32Array | null => {
   const total = referencePreroll.reduce((sum, chunk) => sum + chunk.length, 0);
   if (total < 8000) {
@@ -1130,6 +1154,13 @@ const registerVoiceIpc = () => {
       return;
     }
     service.provider.sendAudio(new Int16Array(buffer));
+  });
+
+  ipcMain.on('cyrvis:voice:keyword-audio', (_event, buffer: ArrayBuffer) => {
+    if (!keywordGate?.available || !(buffer instanceof ArrayBuffer)) {
+      return;
+    }
+    feedHybridKeywordAudio(new Int16Array(buffer));
   });
 
   ipcMain.on('cyrvis:voice:begin-utterance', () => {

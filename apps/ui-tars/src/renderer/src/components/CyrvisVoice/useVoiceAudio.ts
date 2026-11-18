@@ -123,6 +123,7 @@ export function useVoiceAudio() {
   const recordingStartedAtRef = useRef(0);
   const lastSpeechAtRef = useRef(0);
   const pendingPcmRef = useRef(new Uint8Array());
+  const keywordPcmRef = useRef(new Uint8Array());
   const bargePrerollRef = useRef<Float32Array[]>([]);
   const assistantSpeakingRef = useRef(false);
   const speechDeltaRef = useRef('');
@@ -153,6 +154,7 @@ export function useVoiceAudio() {
     legacyPlayerRef.current = null;
     assistantSpeakingRef.current = false;
     bargeFramesRef.current = 0;
+    keywordPcmRef.current = new Uint8Array();
     setPlaybackActive(false);
     window.electron.voice.notifyPlaybackIdle();
   }, []);
@@ -341,6 +343,18 @@ export function useVoiceAudio() {
           input,
           MAX_BARGE_PREROLL_CHUNKS,
         );
+        // Keep the local stop-word detector fed during assistant playback.
+        // The provider drops microphone audio in this window, so this is a
+        // separate KWS-only path.
+        keywordPcmRef.current = appendPcm16(
+          keywordPcmRef.current,
+          floatToPcm16(samples),
+        );
+        const keywordChunks = takePcmChunks(keywordPcmRef.current, 320 * 2);
+        keywordPcmRef.current = keywordChunks.remainder;
+        for (const chunk of keywordChunks.chunks) {
+          window.electron.voice.sendKeywordAudio(chunk.buffer as ArrayBuffer);
+        }
         const threshold = Math.max(
           TTS_BARGE_THRESHOLD,
           noiseFloorRef.current * 2.5,
@@ -348,12 +362,15 @@ export function useVoiceAudio() {
         const nowDiag = Date.now();
         if (nowDiag - lastBargeDiagRef.current >= 500) {
           lastBargeDiagRef.current = nowDiag;
-          console.log('[cyrvis] barge diag', {
-            rms: Number(rms.toFixed(4)),
-            threshold: Number(threshold.toFixed(4)),
-            frames: bargeFramesRef.current,
-            floor: Number(noiseFloorRef.current.toFixed(4)),
-          });
+          console.log(
+            '[cyrvis] barge diag',
+            JSON.stringify({
+              rms: Number(rms.toFixed(4)),
+              threshold: Number(threshold.toFixed(4)),
+              frames: bargeFramesRef.current,
+              floor: Number(noiseFloorRef.current.toFixed(4)),
+            }),
+          );
         }
         bargeFramesRef.current =
           rms >= threshold ? bargeFramesRef.current + 1 : 0;
@@ -362,6 +379,7 @@ export function useVoiceAudio() {
           bargePendingRef.current = true;
           const preRoll = bargePrerollRef.current;
           bargePrerollRef.current = [];
+          keywordPcmRef.current = new Uint8Array();
           cancelPlayer();
           window.electron.voice.cancelSpeechOnly();
           beginStreamingUtterance(preRoll);
