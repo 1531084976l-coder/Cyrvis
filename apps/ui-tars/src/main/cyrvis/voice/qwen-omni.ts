@@ -135,6 +135,10 @@ export class QwenOmniProvider implements VoiceProvider {
     this.context = context.trim();
   }
 
+  isConnected(): boolean {
+    return this.connected;
+  }
+
   connect(): Promise<void> {
     if (this.connected) {
       return Promise.resolve();

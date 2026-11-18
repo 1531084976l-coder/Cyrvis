@@ -30,6 +30,8 @@ export interface VoiceProviderCallbacks {
  */
 export interface VoiceProvider {
   connect(): Promise<void>;
+  /** Whether the realtime transport is ready to accept speech requests. */
+  isConnected?(): boolean;
   setContext?(context: string): void;
   sendAudio(pcm16: Int16Array): void;
   sendToolResult(callId: string, output: string): void;

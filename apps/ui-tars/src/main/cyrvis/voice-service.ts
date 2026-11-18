@@ -66,9 +66,21 @@ const pttMode = false;
 
 /** Speak a proactive reminder through the active realtime voice session. */
 export const speakProactiveText = (text: string): boolean => {
-  if (!service || !text.trim()) return false;
+  if (!service || !text.trim() || service.provider.isConnected?.() !== true) {
+    return false;
+  }
   service.provider.speak(text);
   return true;
+};
+
+/** Show locally spoken proactive text in the voice conversation as well. */
+export const publishProactiveText = (text: string): void => {
+  const normalized = text.trim();
+  if (!normalized) return;
+  broadcast('cyrvis:voice:assistant', { text: normalized, final: true });
+  void voiceMemoryService.appendTurn('assistant', normalized).catch((error) => {
+    logger.warn('[cyrvis follow-up] message persist failed', error);
+  });
 };
 
 const isExternalOutputLabel = (label: string): boolean => {
@@ -1518,8 +1530,7 @@ export const startVoiceService = (): VoiceService | null => {
         },
       };
 
-      const model =
-        process.env.QWEN_MODEL || 'qwen3.8-omni-flash-realtime';
+      const model = process.env.QWEN_MODEL || 'qwen3.8-omni-flash-realtime';
       const workspaceId = process.env.QWEN_WORKSPACE_ID?.trim();
       const endpoint =
         process.env.QWEN_REALTIME_URL ||

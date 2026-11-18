@@ -209,7 +209,7 @@ const initializeApp = async () => {
       }
       mainWindow.focus();
     }
-    if (wasHidden) requestFollowUp('activate');
+    if (wasHidden) requestFollowUp('activate', { force: true });
   });
 
   logger.info('initializeApp end');
