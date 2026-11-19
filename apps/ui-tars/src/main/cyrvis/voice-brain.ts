@@ -6,6 +6,21 @@ import type { CyrvisController } from './controller';
 import { TaskBusyError } from './controller';
 import { classifyIntent, isExplicitChat } from './intent-gate';
 import { ProactivityPolicy, type ProactivityOptions } from './proactivity';
+import {
+  isExplicitTravelGuiRequest,
+  isTravelPlanningText,
+  travelPlanner,
+} from './travel/travel-planner';
+import {
+  appendTravelMemo,
+  writeTravelPlanDesktopTxt,
+} from './travel/travel-memo';
+import {
+  buildTravelSearchQuery,
+  hitsToSnippets,
+  probeTravelHighlights,
+  searchTravelInfo,
+} from './travel/travel-search';
 import type { ControllerEvent } from './types';
 import type { CyrvisVoiceState } from '@shared/cyrvis';
 import type {
@@ -459,6 +474,17 @@ export class VoiceBrain {
         const userIsExplicitChat = this.lastUserText
           ? isExplicitChat(this.lastUserText)
           : false;
+        const travelText = `${this.lastUserText} ${instruction}`;
+        if (
+          isTravelPlanningText(travelText) &&
+          !isExplicitTravelGuiRequest(travelText)
+        ) {
+          this.provider.sendToolResult(
+            call.callId,
+            'REJECTED: this is travel planning, not a desktop GUI task. Use travel_update_plan / travel_probe_highlights / travel_set_preference / travel_set_constraints / travel_expand_aspect / travel_finalize_plan instead. Only call start_gui_task when the user explicitly asks to open a booking site and operate it.',
+          );
+          return;
+        }
 
         // The model often paraphrases the user's task with verbs the gate does
         // not know ("在桌面新建一个txt文件..." lacks 打开/搜索/给我). Allow the
@@ -579,6 +605,263 @@ export class VoiceBrain {
           this.provider.sendToolResult(
             call.callId,
             `ERROR: ${error instanceof Error ? error.message : String(error)}`,
+          );
+        }
+        break;
+      }
+      case 'travel_update_plan': {
+        const snapshot = travelPlanner.updateFramework({
+          destination: call.args.destination,
+          origin: call.args.origin,
+          startDate: call.args.start_date,
+          endDate: call.args.end_date,
+          companions: call.args.companions,
+          budget: call.args.budget,
+          purpose: call.args.purpose,
+          transport: call.args.transport,
+          userText: call.args.user_text || this.lastUserText,
+        });
+        if (snapshot.skeleton) {
+          void appendTravelMemo('framework', '旅行基础框架', snapshot.skeleton);
+        }
+        this.provider.sendToolResult(
+          call.callId,
+          JSON.stringify({
+            ok: true,
+            ...snapshot,
+            message:
+              snapshot.phase === 'probing_preferences'
+                ? 'Framework ready. Briefly speak the skeleton, then call travel_probe_highlights before asking preference.'
+                : 'Speak speakHint. Ask at most one or two missing required fields. Do not open GUI unless explicitly asked.',
+          }),
+        );
+        break;
+      }
+      case 'travel_get_plan': {
+        this.provider.sendToolResult(
+          call.callId,
+          JSON.stringify({ ok: true, ...travelPlanner.getSnapshot() }),
+        );
+        break;
+      }
+      case 'travel_confirm_skeleton': {
+        this.provider.sendToolResult(
+          call.callId,
+          JSON.stringify({
+            ok: true,
+            ...travelPlanner.confirmSkeleton(),
+            message:
+              'If preference is missing, call travel_probe_highlights next. Otherwise offer one preference-biased aspect.',
+          }),
+        );
+        break;
+      }
+      case 'travel_probe_highlights': {
+        const plan = travelPlanner.getSnapshot();
+        if (plan.missingFramework.length > 0) {
+          this.provider.sendToolResult(
+            call.callId,
+            JSON.stringify({
+              ok: false,
+              ...plan,
+              message:
+                'Finish required framework fields before probing highlights.',
+            }),
+          );
+          break;
+        }
+        const probed = await probeTravelHighlights(plan.framework);
+        if (probed.queries[0]) travelPlanner.noteSearch(probed.queries[0]);
+        const snapshot = travelPlanner.setHighlights(probed.highlights);
+        void appendTravelMemo(
+          'highlights',
+          `亮点试探-${plan.framework.destination || '旅行'}`,
+          `${probed.season.monthLabel || ''} ${probed.season.festivalHints.join('、')}；` +
+            snapshot.highlights
+              .map((item) => `${item.interest}:${item.title}`)
+              .join('；'),
+        );
+        this.provider.sendToolResult(
+          call.callId,
+          JSON.stringify({
+            ok: true,
+            ...snapshot,
+            season: probed.season,
+            queries: probed.queries,
+            searchErrors: probed.errors,
+            message:
+              'Mention month/festival context briefly. Speak at most one highlight per category, then ask which single category the user prefers. Soft tone; do not dump long lists.',
+          }),
+        );
+        break;
+      }
+      case 'travel_set_preference': {
+        const interest = call.args.interest?.trim();
+        if (!interest) {
+          this.provider.sendToolResult(
+            call.callId,
+            'ERROR: interest is required.',
+          );
+          break;
+        }
+        const snapshot = travelPlanner.setPreference(interest, call.args.notes);
+        void appendTravelMemo(
+          'preference',
+          '旅行偏好',
+          snapshot.interestLabel || interest,
+        );
+        this.provider.sendToolResult(
+          call.callId,
+          JSON.stringify({
+            ok: true,
+            ...snapshot,
+            message:
+              'Acknowledge the preference with a soft bridge, then ask the constraint card (walking / early start / queues). Do not jump straight into full itinerary.',
+          }),
+        );
+        break;
+      }
+      case 'travel_set_constraints': {
+        const snapshot = travelPlanner.setConstraints({
+          okWithWalking: call.args.ok_with_walking,
+          okWithEarlyStart: call.args.ok_with_early_start,
+          okWithQueues: call.args.ok_with_queues,
+          notes: call.args.notes,
+          userText: call.args.user_text || this.lastUserText,
+        });
+        void appendTravelMemo(
+          'constraints',
+          '旅行约束卡片',
+          JSON.stringify(snapshot.constraints),
+        );
+        this.provider.sendToolResult(
+          call.callId,
+          JSON.stringify({
+            ok: true,
+            ...snapshot,
+            message:
+              'Confirm constraints softly, then offer exactly one next aspect. Use softBridge wording; never hard-stop the conversation.',
+          }),
+        );
+        break;
+      }
+      case 'travel_expand_aspect': {
+        const aspect = call.args.aspect?.trim();
+        if (!aspect) {
+          this.provider.sendToolResult(
+            call.callId,
+            'ERROR: aspect is required.',
+          );
+          break;
+        }
+        let snippets: string[] = [];
+        if (call.args.with_search !== false) {
+          const plan = travelPlanner.getSnapshot();
+          const query = buildTravelSearchQuery(
+            plan.framework,
+            null,
+            `${aspect} ${call.args.notes || ''}`.trim(),
+          );
+          travelPlanner.noteSearch(query);
+          const search = await searchTravelInfo(query);
+          snippets = hitsToSnippets(search.hits);
+        }
+        travelPlanner.syncFromConversation([
+          this.lastUserText,
+          aspect,
+          call.args.notes || '',
+        ]);
+        const snapshot = travelPlanner.expandAspect(
+          aspect,
+          call.args.notes,
+          snippets,
+          this.lastUserText,
+        );
+        const latest = snapshot.aspects[snapshot.aspects.length - 1];
+        if (latest) {
+          void appendTravelMemo('aspect', latest.aspect, latest.summary);
+        }
+        this.provider.sendToolResult(
+          call.callId,
+          JSON.stringify({
+            ok: true,
+            ...snapshot,
+            searchSnippets: snippets,
+            message:
+              'Speak the concrete 可执行选项 from speakHint (named places/areas). Do NOT re-ask travel preference. Vary wording; do not copy the previous sentence. Soft-bridge once, then stop or offer one next aspect.',
+          }),
+        );
+        break;
+      }
+      case 'travel_search': {
+        const plan = travelPlanner.getSnapshot();
+        const query =
+          call.args.query?.trim() ||
+          buildTravelSearchQuery(
+            plan.framework,
+            null,
+            call.args.aspect || this.lastUserText,
+          );
+        travelPlanner.noteSearch(query);
+        // Keep planner warm even when search is the first travel tool call.
+        if (plan.phase === 'idle' && this.lastUserText) {
+          travelPlanner.updateFramework({ userText: this.lastUserText });
+        }
+        const search = await searchTravelInfo(query);
+        this.provider.sendToolResult(
+          call.callId,
+          JSON.stringify({
+            ok: search.ok,
+            query: search.query,
+            hits: search.hits,
+            error: search.error,
+            plan: travelPlanner.getSnapshot(),
+            message:
+              'Use hits as research hints only. Ask proactive clarifying questions for missing framework slots or preferences until the user is satisfied. Do not invent exact live ticket prices.',
+          }),
+        );
+        break;
+      }
+      case 'travel_decline_expand': {
+        const snapshot = travelPlanner.declineFurther();
+        void appendTravelMemo(
+          'pause',
+          '旅行规划先告一段落',
+          snapshot.skeleton || snapshot.speakHint,
+        );
+        this.provider.sendToolResult(
+          call.callId,
+          JSON.stringify({
+            ok: true,
+            ...snapshot,
+            message:
+              'Use soft closing language. Offer travel_finalize_plan if the user wants a desktop summary txt.',
+          }),
+        );
+        break;
+      }
+      case 'travel_finalize_plan': {
+        try {
+          const plan = travelPlanner.getSnapshot();
+          const written = await writeTravelPlanDesktopTxt(plan);
+          const snapshot = travelPlanner.markFinalized(written.desktopPath);
+          this.provider.sendToolResult(
+            call.callId,
+            JSON.stringify({
+              ok: true,
+              ...snapshot,
+              desktopPath: written.desktopPath,
+              memoPath: written.memoPath,
+              message:
+                'Tell the user the desktop txt is open with a clear summary. Invite them to add more later softly.',
+            }),
+          );
+        } catch (error) {
+          this.provider.sendToolResult(
+            call.callId,
+            `ERROR: failed to write travel plan txt: ${
+              error instanceof Error ? error.message : String(error)
+            }`,
           );
         }
         break;

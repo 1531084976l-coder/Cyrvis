@@ -9,6 +9,7 @@ import { execFile, type ChildProcess } from 'node:child_process';
 import { logger } from '@main/logger';
 import type { CyrvisMemorySnapshot } from '@shared/cyrvis';
 import { voiceMemoryService } from './memory';
+import { travelPlanner } from './travel/travel-planner';
 import { publishProactiveText, speakProactiveText } from './voice-service';
 
 export type FollowUpReason =
@@ -139,6 +140,41 @@ const buildContextualSuggestion = (
   memory: CyrvisMemorySnapshot,
   previous: string,
 ): string => {
+  const recentTurns = memory.turns
+    .slice(-6)
+    .map((turn) => turn.text.trim())
+    .filter(Boolean);
+  travelPlanner.syncFromConversation(recentTurns);
+  const travelHint = travelPlanner.buildIdleSuggestion(recentTurns);
+  if (travelHint) {
+    // Never emit a near-duplicate idle prompt.
+    const norm = (text: string) => text.replace(/\s+/g, '');
+    if (previous && norm(travelHint) === norm(previous)) {
+      return pickDifferent(
+        [
+          '要不要我直接给你两个能落地的具体推荐？',
+          '我可以先出一个可执行小方案，你觉得不对再改。',
+          '这一段我们先停一下也行，想到细节再说。',
+        ],
+        previous,
+      );
+    }
+    if (
+      previous &&
+      (norm(travelHint).includes(norm(previous).slice(0, 16)) ||
+        norm(previous).includes(norm(travelHint).slice(0, 16)))
+    ) {
+      return pickDifferent(
+        [
+          '我直接给你具体点位吧，还是你想先换个方向？',
+          '要不我按你刚才说的，先推荐住宿或行程里的可选项。',
+        ],
+        previous,
+      );
+    }
+    return travelHint;
+  }
+
   const lastUser = [...memory.turns]
     .reverse()
     .find((turn) => turn.role === 'user');
