@@ -128,18 +128,108 @@ const createGreeting = (
   );
 };
 
-const compactTopic = (text: string): string => {
-  const normalized = text
-    .replace(/\s+/g, ' ')
-    .replace(/[。！？!?]+$/g, '')
-    .trim();
-  return normalized.length > 34 ? `${normalized.slice(0, 32)}……` : normalized;
-};
-
 const clipDetail = (text: string, max = 48): string => {
   const normalized = text.replace(/\s+/g, ' ').trim();
   if (normalized.length <= max) return normalized;
   return `${normalized.slice(0, max - 1)}…`;
+};
+
+/** Greetings / status checks — never quote these as the “task topic”. */
+const isLowSignalUtterance = (text: string): boolean => {
+  const t = text.replace(/\s+/g, '').trim();
+  if (!t || t.length < 4) return true;
+  if (
+    /^(你好|您好|嗨|在吗|嘿|嗯|好的|好|行|谢谢|收到|继续|然后呢|ok|hi|hello)[吗呀啊呢。！？!?.]*$/i.test(
+      t,
+    )
+  ) {
+    return true;
+  }
+  return /(删除了吗|做完了吗|好了吗|完成了吗|弄好了吗|怎么样了|还在吗|听见了吗)/.test(
+    t,
+  );
+};
+
+const stripTaskPrefix = (text: string): string =>
+  text
+    .replace(/^启动电脑任务[:：]\s*/, '')
+    .replace(/^(已经|已|我)?(帮你)?/, '')
+    .trim();
+
+/** Prefer action summary over echoing the latest user sentence. */
+const synthesizeRecentWork = (
+  memory: CyrvisMemorySnapshot,
+): { action: string; objectHint: string | null } | null => {
+  const recentActivities = [...memory.activities].slice(-8).reverse();
+  for (const activity of recentActivities) {
+    const raw = stripTaskPrefix(activity.text);
+    if (!raw || isLowSignalUtterance(raw)) continue;
+    if (
+      activity.kind === 'task' ||
+      /启动电脑任务|删除|新建|创建|写入|打开|整理|下载|保存|旅行计划/.test(
+        activity.text,
+      )
+    ) {
+      return {
+        action: clipDetail(raw, 36),
+        objectHint: raw.match(/桌面|旅行计划|文件|文件夹|记事本/)?.[0] || null,
+      };
+    }
+  }
+
+  const recentAssistant = [...memory.turns]
+    .filter((turn) => turn.role === 'assistant')
+    .slice(-6)
+    .reverse();
+  for (const turn of recentAssistant) {
+    const text = turn.text.trim();
+    if (isLowSignalUtterance(text)) continue;
+    const done =
+      text.match(
+        /(?:已|已经)?(?:帮你)?(删(?:除|掉)|清理|新建|创建|写入|保存|打开|整理|下载)[^。！？!?]{0,28}/,
+      )?.[0] || text.match(/桌面上的[^。！？!?]{0,20}(?:文件|计划)/)?.[0];
+    if (done) {
+      return { action: clipDetail(done, 36), objectHint: null };
+    }
+  }
+
+  const substantiveUser = [...memory.turns]
+    .filter((turn) => turn.role === 'user')
+    .slice(-10)
+    .reverse()
+    .map((turn) => turn.text.trim())
+    .find(
+      (text) =>
+        !isLowSignalUtterance(text) &&
+        /(删|删除|清理|新建|创建|写入|打开|整理|下载|保存|帮我|给我|把.+|旅行|计划|文件)/.test(
+          text,
+        ),
+    );
+  if (substantiveUser) {
+    const intent =
+      substantiveUser.match(
+        /(?:帮我|给我|请)?(.{0,4}(?:删(?:除|掉)|清理|新建|创建|写入|打开|整理|下载|保存)[^，。！？!?]{0,28})/,
+      )?.[1] || substantiveUser;
+    return { action: clipDetail(intent, 36), objectHint: null };
+  }
+
+  return null;
+};
+
+const buildActionResumeLine = (
+  memory: CyrvisMemorySnapshot,
+  previous: string,
+): string | null => {
+  const work = synthesizeRecentWork(memory);
+  if (!work) return null;
+  return pickDifferent(
+    [
+      `上次你让我${work.action}，还需要继续执行吗？`,
+      `刚才那件事（${work.action}）告一段落了，还要我接着做吗？`,
+      `桌面相关操作已经走到「${work.action}」这一步，需要继续完善吗？`,
+    ],
+    previous,
+  );
 };
 
 /** Soft-fill planner from memory after restart (in-memory state is empty). */
@@ -183,43 +273,22 @@ const rehydrateTravelFromMemory = (memory: CyrvisMemorySnapshot): void => {
 const buildResumeFromMemoryFallback = (
   memory: CyrvisMemorySnapshot,
 ): string | null => {
-  const recentUser = [...memory.turns]
-    .reverse()
-    .find((turn) => turn.role === 'user');
+  const work = synthesizeRecentWork(memory);
+  if (work) {
+    const second =
+      work.objectHint && !work.action.includes(work.objectHint)
+        ? `当时主要围绕${work.objectHint}在推进`
+        : '内容和步骤已经有一部分进展';
+    return `上次你让我${work.action}。${second}。需要继续完善这个任务吗？`;
+  }
+
   const recentAssistant = [...memory.turns]
     .reverse()
-    .find((turn) => turn.role === 'assistant');
-  const recentTask = [...memory.activities]
-    .reverse()
     .find(
-      (item) =>
-        item.kind === 'task' ||
-        /启动电脑任务|旅行|行程|计划|任务/.test(item.text),
+      (turn) => turn.role === 'assistant' && !isLowSignalUtterance(turn.text),
     );
-
-  if (!recentUser && !recentTask) return null;
-
-  const topic = compactTopic(
-    recentTask?.text.replace(/^启动电脑任务：/, '') ||
-      recentUser?.text ||
-      '上一个任务',
-  );
-  const details: string[] = [];
-  if (recentAssistant?.text) {
-    details.push(`上次聊到：${clipDetail(recentAssistant.text)}`);
-  }
-  if (recentUser?.text && recentUser.text !== topic) {
-    details.push(`你那边主要在说：${clipDetail(recentUser.text)}`);
-  }
-  if (!details.length && recentTask?.text) {
-    details.push(`相关活动是：${clipDetail(recentTask.text)}`);
-  }
-  if (!details.length) {
-    details.push('当时还没完全收尾，细节还可以接着补');
-  }
-
-  const body = details.slice(0, 2).join('。');
-  return `上次我们一起在做「${topic}」。${body}。需要继续完善这个任务吗？`;
+  if (!recentAssistant) return null;
+  return `上次我们推进到：${clipDetail(recentAssistant.text, 40)}。需要继续完善这个任务吗？`;
 };
 
 /** Launch/activate/resume: summarize last task instead of a bare continue ask. */
@@ -301,12 +370,35 @@ const buildContextualSuggestion = (
     );
   }
 
+  // Look past status-check lines — summarize earlier substance + activities.
+  const recentUserBlob = memory.turns
+    .filter((turn) => turn.role === 'user')
+    .slice(-8)
+    .map((turn) => turn.text)
+    .join(' ');
   const recentActivities = memory.activities
-    .filter((activity) => activity.createdAt >= lastUser.createdAt)
-    .slice(-4)
+    .slice(-8)
     .map((activity) => activity.text)
     .join(' ');
-  const context = `${lastUser.text} ${recentActivities}`;
+  const recentAssistantBlob = memory.turns
+    .filter((turn) => turn.role === 'assistant')
+    .slice(-4)
+    .map((turn) => turn.text)
+    .join(' ');
+  const context = `${recentUserBlob} ${recentActivities} ${recentAssistantBlob}`;
+
+  if (/(删|删除|清理).{0,12}(桌面|文件|文件夹|计划)/.test(context)) {
+    const actionLine = buildActionResumeLine(memory, previous);
+    if (actionLine) return actionLine;
+    return pickDifferent(
+      [
+        '上次你让我处理桌面上的文件，还需要继续执行吗？',
+        '桌面文件相关操作告一段落了，还要我接着做吗？',
+      ],
+      previous,
+    );
+  }
+
   const bookTitle = context.match(/《([^》]{1,30})》/)?.[1];
   const poemTitle =
     bookTitle || context.match(/(满江红|沁园春|念奴娇|水调歌头)/)?.[1];
@@ -370,12 +462,15 @@ const buildContextualSuggestion = (
     );
   }
 
-  const topic = compactTopic(lastUser.text);
+  // Never echo the latest user utterance (e.g. “你好，你删除了吗”) as the topic.
+  const actionLine = buildActionResumeLine(memory, previous);
+  if (actionLine) return actionLine;
+
   return pickDifferent(
     [
-      `关于“${topic}”，要不要我根据刚才的结果继续整理下一步？`,
-      `刚才我们在处理“${topic}”，需要我再做一次延伸分析吗？`,
-      `“${topic}”这件事还可以继续往下推进，要不要我给你两三个具体选项？`,
+      '刚才那件事已经有了结果，还需要我继续执行吗？',
+      '上一步已经做完了，要不要我根据进度接着推进？',
+      '这边可以继续帮你收尾，需要我接着做吗？',
     ],
     previous,
   );
