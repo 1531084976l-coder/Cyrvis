@@ -387,9 +387,12 @@ const buildContextualSuggestion = (
     .join(' ');
   const context = `${recentUserBlob} ${recentActivities} ${recentAssistantBlob}`;
 
+  // Prefer a concrete action summary over canned category templates.
+  // (Templates like “开发任务/跑测试” used to fire on weak words such as 项目.)
+  const actionLine = buildActionResumeLine(memory, previous);
+  if (actionLine) return actionLine;
+
   if (/(删|删除|清理).{0,12}(桌面|文件|文件夹|计划)/.test(context)) {
-    const actionLine = buildActionResumeLine(memory, previous);
-    if (actionLine) return actionLine;
     return pickDifferent(
       [
         '上次你让我处理桌面上的文件，还需要继续执行吗？',
@@ -418,7 +421,12 @@ const buildContextualSuggestion = (
     );
   }
 
-  if (/(代码|程序|项目|报错|bug|接口|API|开发|实现|修复)/i.test(context)) {
+  // Strong coding signals only — do NOT match 项目/开发/实现 alone.
+  if (
+    /(写代码|改代码|源代码|报错|报错信息|单元测试|跑测试|编译失败|\bbug\b|\bAPI\b|接口报错|pull request|\bgit\b)/i.test(
+      context,
+    )
+  ) {
     return pickDifferent(
       [
         '刚才的开发任务有了进展，要不要我接着跑一遍测试并检查边界情况？',
@@ -429,7 +437,7 @@ const buildContextualSuggestion = (
     );
   }
 
-  if (/(论文|作业|报告|文章|文档|申请|简历|演讲稿|写一篇)/.test(context)) {
+  if (/(论文|作业|报告|申请|简历|演讲稿|写一篇)/.test(context)) {
     return pickDifferent(
       [
         '刚才的文字内容已经有了基础，要不要我接着帮你润色结构和表达？',
@@ -440,7 +448,7 @@ const buildContextualSuggestion = (
     );
   }
 
-  if (/(搜索|查找|研究|资料|对比|调研|分析)/.test(context)) {
+  if (/(搜索|查找|研究|资料|对比|调研)/.test(context)) {
     return pickDifferent(
       [
         '刚才查到的信息要不要继续整理成要点，并比较一下不同来源的结论？',
@@ -451,20 +459,16 @@ const buildContextualSuggestion = (
     );
   }
 
-  if (/(旅行|出行|行程|计划|安排|日程|清单)/.test(context)) {
+  if (/(旅行|出行|行程|旅游|机票|酒店)/.test(context)) {
     return pickDifferent(
       [
-        '刚才的计划要不要继续拆成时间表和待办清单？',
-        '下一步要不要我检查时间冲突，再给你准备一个备用方案？',
-        '要不要把刚才的安排整理成一份更容易执行的行动清单？',
+        '刚才的旅行计划要不要继续拆成时间表和待办清单？',
+        '下一步要不要我检查行程冲突，再给你准备一个备用方案？',
+        '要不要把刚才的出行安排整理成一份更容易执行的行动清单？',
       ],
       previous,
     );
   }
-
-  // Never echo the latest user utterance (e.g. “你好，你删除了吗”) as the topic.
-  const actionLine = buildActionResumeLine(memory, previous);
-  if (actionLine) return actionLine;
 
   return pickDifferent(
     [
@@ -661,14 +665,15 @@ export const registerFollowUpService = (): void => {
       if (followUpStore.get('pending')) return;
 
       const memory = await voiceMemoryService.getSnapshot();
+      // Only user speech + real tasks reset the idle window. Assistant
+      // proactive lines / speech activities must not immediately re-trigger.
       const lastUserAt = memory.turns
         .filter((turn) => turn.role === 'user')
         .reduce((latest, turn) => Math.max(latest, turn.createdAt), 0);
-      const lastActivityAt = memory.activities.reduce(
-        (latest, activity) => Math.max(latest, activity.createdAt),
-        0,
-      );
-      const sourceAt = Math.max(lastUserAt, lastActivityAt);
+      const lastTaskAt = memory.activities
+        .filter((activity) => activity.kind === 'task')
+        .reduce((latest, activity) => Math.max(latest, activity.createdAt), 0);
+      const sourceAt = Math.max(lastUserAt, lastTaskAt);
 
       // Voice activity does not reset macOS's keyboard/mouse idle clock. Start
       // the 10-second window from the latest conversation/task event as well.
@@ -702,7 +707,8 @@ export const registerFollowUpService = (): void => {
       });
       if (prompt) {
         idleSuggestionShown = true;
-        lastIdleSourceAt = sourceAt || Date.now();
+        // Stamp "now" so the proactive reply itself cannot open a new episode.
+        lastIdleSourceAt = Date.now();
       }
     })()
       .catch((error) => {
