@@ -8,6 +8,7 @@ import {
   Volume2,
 } from 'lucide-react';
 
+import { LinkifiedText } from './LinkifiedText';
 import { useVoiceAudio } from './useVoiceAudio';
 
 const STATUS_LABEL: Record<string, string> = {
@@ -119,13 +120,15 @@ export function CyrvisVoiceBar() {
               )}
             </div>
             <div className="truncate text-xs text-gray-500 dark:text-gray-400">
-              {error
-                ? error
-                : assistantText ||
-                  transcript ||
-                  (state.awake
-                    ? 'Listening… say a command.'
-                    : 'Say “Hello CYRVIS” to wake me.')}
+              {error ? (
+                error
+              ) : assistantText || transcript ? (
+                <LinkifiedText text={assistantText || transcript} />
+              ) : state.awake ? (
+                'Listening… say a command.'
+              ) : (
+                'Say “Hello CYRVIS” to wake me.'
+              )}
             </div>
           </div>
 

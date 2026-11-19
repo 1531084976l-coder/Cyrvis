@@ -46,9 +46,36 @@ const slimTravelResult = (
   preferredNextAspect: snapshot.preferredNextAspect,
   softBridge: snapshot.softBridge,
   speakHint: snapshot.speakHint,
-  skeleton: snapshot.skeleton,
+  // Prefer speakHint over raw skeleton wording (“骨架攻略”).
+  routeHint: snapshot.skeleton
+    ? snapshot.skeleton.replace(/^骨架攻略：|^行程要点：/, '')
+    : null,
+  confirmedBookings: snapshot.confirmedBookings.slice(0, 4),
+  latestAspects: snapshot.aspects.slice(-2).map((item) => ({
+    aspect: item.aspect,
+    summary: item.summary.slice(0, 220),
+  })),
   ...extra,
 });
+
+const coerceOptionalBoolean = (value: unknown): boolean | null | undefined => {
+  if (value === undefined) return undefined;
+  if (value === null) return null;
+  if (typeof value === 'boolean') return value;
+  if (typeof value === 'number') return value !== 0;
+  if (typeof value === 'string') {
+    const text = value.trim().toLowerCase();
+    if (['true', '1', 'yes', 'y', '是', '可以', '能', '接受'].includes(text)) {
+      return true;
+    }
+    if (
+      ['false', '0', 'no', 'n', '否', '不', '不行', '不能', '别'].includes(text)
+    ) {
+      return false;
+    }
+  }
+  return undefined;
+};
 
 export interface VoiceBrainCallbacks {
   onAudio?: (pcm16: Int16Array) => void;
@@ -641,7 +668,7 @@ export class VoiceBrain {
           userText: call.args.user_text || this.lastUserText,
         });
         if (snapshot.skeleton) {
-          void appendTravelMemo('framework', '旅行基础框架', snapshot.skeleton);
+          void appendTravelMemo('framework', '旅行行程要点', snapshot.skeleton);
         }
         this.provider.sendToolResult(
           call.callId,
@@ -733,12 +760,16 @@ export class VoiceBrain {
           '旅行偏好',
           snapshot.interestLabel || interest,
         );
+        const latest = snapshot.aspects[snapshot.aspects.length - 1];
         this.provider.sendToolResult(
           call.callId,
           JSON.stringify(
             slimTravelResult(snapshot, {
+              latestAspect: latest
+                ? { aspect: latest.aspect, summary: latest.summary }
+                : null,
               message:
-                'Acknowledge preference in one short line, then ask constraint card.',
+                'Speak the concrete day plan from speakHint (named places). Do NOT narrate process or say you will organize later. No booking URLs until they pick one option.',
             }),
           ),
         );
@@ -746,23 +777,38 @@ export class VoiceBrain {
       }
       case 'travel_set_constraints': {
         const snapshot = travelPlanner.setConstraints({
-          okWithWalking: call.args.ok_with_walking,
-          okWithEarlyStart: call.args.ok_with_early_start,
-          okWithQueues: call.args.ok_with_queues,
+          okWithWalking: coerceOptionalBoolean(call.args.ok_with_walking),
+          okWithEarlyStart: coerceOptionalBoolean(
+            call.args.ok_with_early_start,
+          ),
+          okWithQueues: coerceOptionalBoolean(call.args.ok_with_queues),
           notes: call.args.notes,
           userText: call.args.user_text || this.lastUserText,
         });
         void appendTravelMemo(
           'constraints',
-          '旅行约束卡片',
-          JSON.stringify(snapshot.constraints),
+          '行程节奏备注',
+          travelPlanner.getSnapshot().constraints
+            ? [
+                `步行：${snapshot.constraints.okWithWalking === false ? '尽量少走' : '可以多走走'}`,
+                `早起：${snapshot.constraints.okWithEarlyStart === false ? '不赶早' : '可以早出门'}`,
+                `排队：${snapshot.constraints.okWithQueues === false ? '少排队' : '能接受'}`,
+                snapshot.constraints.notes || '',
+              ]
+                .filter(Boolean)
+                .join('；')
+            : '轻松不赶早',
         );
+        const latest = snapshot.aspects[snapshot.aspects.length - 1];
         this.provider.sendToolResult(
           call.callId,
           JSON.stringify(
             slimTravelResult(snapshot, {
+              latestAspect: latest
+                ? { aspect: latest.aspect, summary: latest.summary }
+                : null,
               message:
-                'Confirm constraints briefly, then offer one next aspect.',
+                'Speak the concrete executable plan from speakHint first. Put pace notes in one short aside. Never dump JSON. No URLs until they confirm an option.',
             }),
           ),
         );
@@ -779,16 +825,14 @@ export class VoiceBrain {
         }
         let snippets: string[] = [];
         const bookableLike =
-          /ticket|accommodation|门票|票务|买票|订票|预约|预订|雪票|住宿|酒店|民宿|ski/i.test(
+          /ticket|accommodation|budget|门票|票务|买票|订票|预约|预订|雪票|住宿|酒店|民宿|ski/i.test(
             aspect,
           ) ||
           /(门票|买票|订票|预约|预订|雪票|展览票|演出票|乐园|住宿|酒店|民宿|住哪|帮我订)/.test(
             this.lastUserText || '',
           );
-        // Tickets + hotels: catalog/generic links only — never GUI booking loops.
-        const shouldSearch =
-          call.args.with_search === true ||
-          (call.args.with_search !== false && !bookableLike);
+        // Bookable aspects: never search (avoids URL bleed before confirm).
+        const shouldSearch = !bookableLike && call.args.with_search !== false;
         if (shouldSearch) {
           const plan = travelPlanner.getSnapshot();
           const query = buildTravelSearchQuery(
@@ -805,16 +849,21 @@ export class VoiceBrain {
           aspect,
           call.args.notes || '',
         ]);
+        const pureConfirm = (() => {
+          const compact = (this.lastUserText || '').replace(/\s+/g, '');
+          return /^(选[123一二三]|选第[123一二三]个|第[123一二三]个|选第一个|选第二个|选第三个|就这个|就它|定这个|要这个|选定了?|就选这个)$/.test(
+            compact,
+          )
+            ? this.lastUserText
+            : undefined;
+        })();
         const snapshot = travelPlanner.expandAspect(
           aspect,
-          call.args.notes,
+          call.args.notes || pureConfirm,
           snippets,
           this.lastUserText,
         );
         const latest = snapshot.aspects[snapshot.aspects.length - 1];
-        if (latest) {
-          void appendTravelMemo('aspect', latest.aspect, latest.summary);
-        }
         this.provider.sendToolResult(
           call.callId,
           JSON.stringify(
@@ -823,8 +872,8 @@ export class VoiceBrain {
                 ? { aspect: latest.aspect, summary: latest.summary }
                 : null,
               message: bookableLike
-                ? 'Speak 2-3 option names briefly; say links are in the notes. No GUI. Soft-bridge once.'
-                : 'Speak Day plan / options briefly from speakHint. Do not re-ask preference.',
+                ? 'Speak 2-3 option names only; do NOT read URLs until the user picks one. Then give that one booking link. No GUI.'
+                : 'Speak Day plan / options briefly from speakHint. Do not re-ask preference. No booking URLs until they confirm an option.',
             }),
           ),
         );
@@ -850,11 +899,16 @@ export class VoiceBrain {
           JSON.stringify({
             ok: search.ok,
             query: search.query,
-            hits: search.hits.slice(0, 3),
+            hits: search.hits.slice(0, 3).map((hit) => ({
+              title: hit.title,
+              snippet: (hit.snippet || '')
+                .replace(/https?:\/\/\S+/gi, '')
+                .trim(),
+            })),
             error: search.error,
             phase: travelPlanner.getSnapshot().phase,
             message:
-              'Use hits as short hints only. Do not invent live prices. Speak briefly.',
+              'Use titles/snippets as short hints only. Do not read or invent booking URLs here. Speak briefly.',
           }),
         );
         break;
@@ -871,7 +925,7 @@ export class VoiceBrain {
           JSON.stringify(
             slimTravelResult(snapshot, {
               message:
-                'Soft close in one sentence. Offer travel_finalize_plan if they want the desktop txt.',
+                'Soft close in one sentence. Offer travel_finalize_plan if they want the desktop HTML plan page.',
             }),
           ),
         );
@@ -899,7 +953,7 @@ export class VoiceBrain {
         } catch (error) {
           this.provider.sendToolResult(
             call.callId,
-            `ERROR: failed to write travel plan txt: ${
+            `ERROR: failed to write travel plan HTML: ${
               error instanceof Error ? error.message : String(error)
             }`,
           );
