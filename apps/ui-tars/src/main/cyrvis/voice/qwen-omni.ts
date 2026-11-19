@@ -589,6 +589,29 @@ export class QwenOmniProvider implements VoiceProvider {
       return;
     }
 
+    // DashScope sometimes emits quota/auth failures as a bare {code,message}
+    // payload (no type), then closes with 1006 — surface that clearly.
+    if (
+      typeof event.type !== 'string' &&
+      typeof event.code === 'string' &&
+      typeof event.message === 'string'
+    ) {
+      const detail = `${event.code}: ${event.message}`;
+      const error = new Error(
+        /FreeTierOnly|quota|exhausted/i.test(detail)
+          ? `Qwen 免费额度已用尽（${event.code}）。请到百炼/DashScope 控制台关闭「仅用免费额度」或完成付费开通后再试。`
+          : `Qwen realtime error (${detail})`,
+      );
+      this.callbacks.onError?.(error);
+      this.failConnect(error);
+      try {
+        this.ws?.close();
+      } catch {
+        // ignore
+      }
+      return;
+    }
+
     switch (event.type) {
       case 'session.created':
         this.sendSessionUpdate();

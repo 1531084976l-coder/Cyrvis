@@ -85,7 +85,8 @@ export const searchTravelInfo = async (
   }
 
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 8000);
+  // Keep travel search snappy; Instant Answer rarely helps CN booking links.
+  const timer = setTimeout(() => controller.abort(), 3500);
   try {
     const url = `https://api.duckduckgo.com/?q=${encodeURIComponent(trimmed)}&format=json&no_html=1&skip_disambig=1`;
     const response = await fetch(url, {
@@ -176,23 +177,31 @@ export const probeTravelHighlights = async (
   const errors: string[] = [];
   const season = buildSeasonContext(framework.startDate, framework.endDate);
 
-  for (const interest of INTEREST_ORDER) {
-    const query = buildInterestSearchQuery(framework, interest);
-    queries.push(query);
-    const result = await searchTravelInfo(query, 3);
-    if (!result.ok && result.error) errors.push(`${interest}:${result.error}`);
-    const top = result.hits[0];
+  const settled = await Promise.all(
+    INTEREST_ORDER.map(async (interest) => {
+      const query = buildInterestSearchQuery(framework, interest);
+      const result = await searchTravelInfo(query, 3);
+      return { interest, query, result };
+    }),
+  );
+
+  for (const row of settled) {
+    queries.push(row.query);
+    if (!row.result.ok && row.result.error) {
+      errors.push(`${row.interest}:${row.result.error}`);
+    }
+    const top = row.result.hits[0];
     if (top?.title) {
       highlights.push({
-        interest,
+        interest: row.interest,
         title: top.title.slice(0, 80),
-        detail: (top.snippet || INTEREST_LABEL[interest]).slice(0, 100),
+        detail: (top.snippet || INTEREST_LABEL[row.interest]).slice(0, 100),
       });
     } else {
       // Fallback stub so probing still works offline / empty search.
       highlights.push({
-        interest,
-        title: `${framework.destination || '当地'}${season.monthLabel || ''}${INTEREST_LABEL[interest]}`,
+        interest: row.interest,
+        title: `${framework.destination || '当地'}${season.monthLabel || ''}${INTEREST_LABEL[row.interest]}`,
         detail: season.festivalHints[0]
           ? `${season.festivalHints[0]}时节参考`
           : '检索暂无结果，先用类别占位，可再细查',

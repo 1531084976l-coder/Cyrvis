@@ -28,8 +28,27 @@ import type {
   VoiceProviderCallbacks,
   VoiceToolCallWithId,
 } from './voice/provider';
+import type { TravelPlanSnapshot } from './travel/travel-planner';
 
 export type VoiceBrainState = CyrvisVoiceState;
+
+/** Compact travel tool payloads so the voice model does not stall on huge JSON. */
+const slimTravelResult = (
+  snapshot: TravelPlanSnapshot,
+  extra: Record<string, unknown> = {},
+): Record<string, unknown> => ({
+  ok: true,
+  phase: snapshot.phase,
+  missingFramework: snapshot.missingFramework,
+  nextQuestion: snapshot.nextQuestion,
+  primaryInterest: snapshot.primaryInterest,
+  interestLabel: snapshot.interestLabel,
+  preferredNextAspect: snapshot.preferredNextAspect,
+  softBridge: snapshot.softBridge,
+  speakHint: snapshot.speakHint,
+  skeleton: snapshot.skeleton,
+  ...extra,
+});
 
 export interface VoiceBrainCallbacks {
   onAudio?: (pcm16: Int16Array) => void;
@@ -626,33 +645,36 @@ export class VoiceBrain {
         }
         this.provider.sendToolResult(
           call.callId,
-          JSON.stringify({
-            ok: true,
-            ...snapshot,
-            message:
-              snapshot.phase === 'probing_preferences'
-                ? 'Framework ready. Briefly speak the skeleton, then call travel_probe_highlights before asking preference.'
-                : 'Speak speakHint. Ask at most one or two missing required fields. Do not open GUI unless explicitly asked.',
-          }),
+          JSON.stringify(
+            slimTravelResult(snapshot, {
+              message: /travel_expand_aspect|tickets|订票|雪票/.test(
+                snapshot.speakHint || '',
+              )
+                ? 'Call travel_expand_aspect(aspect=tickets, with_search=false). Speak briefly; no GUI.'
+                : snapshot.phase === 'probing_preferences'
+                  ? 'Speak skeleton in one short line, then travel_probe_highlights.'
+                  : 'Speak speakHint briefly; ask at most one missing field.',
+            }),
+          ),
         );
         break;
       }
       case 'travel_get_plan': {
         this.provider.sendToolResult(
           call.callId,
-          JSON.stringify({ ok: true, ...travelPlanner.getSnapshot() }),
+          JSON.stringify(slimTravelResult(travelPlanner.getSnapshot())),
         );
         break;
       }
       case 'travel_confirm_skeleton': {
         this.provider.sendToolResult(
           call.callId,
-          JSON.stringify({
-            ok: true,
-            ...travelPlanner.confirmSkeleton(),
-            message:
-              'If preference is missing, call travel_probe_highlights next. Otherwise offer one preference-biased aspect.',
-          }),
+          JSON.stringify(
+            slimTravelResult(travelPlanner.confirmSkeleton(), {
+              message:
+                'If preference missing, travel_probe_highlights next. Speak short.',
+            }),
+          ),
         );
         break;
       }
@@ -661,12 +683,12 @@ export class VoiceBrain {
         if (plan.missingFramework.length > 0) {
           this.provider.sendToolResult(
             call.callId,
-            JSON.stringify({
-              ok: false,
-              ...plan,
-              message:
-                'Finish required framework fields before probing highlights.',
-            }),
+            JSON.stringify(
+              slimTravelResult(plan, {
+                ok: false,
+                message: 'Finish required framework fields first.',
+              }),
+            ),
           );
           break;
         }
@@ -683,15 +705,16 @@ export class VoiceBrain {
         );
         this.provider.sendToolResult(
           call.callId,
-          JSON.stringify({
-            ok: true,
-            ...snapshot,
-            season: probed.season,
-            queries: probed.queries,
-            searchErrors: probed.errors,
-            message:
-              'Mention month/festival context briefly. Speak at most one highlight per category, then ask which single category the user prefers. Soft tone; do not dump long lists.',
-          }),
+          JSON.stringify(
+            slimTravelResult(snapshot, {
+              highlights: snapshot.highlights.map((item) => ({
+                interest: item.interest,
+                title: item.title,
+              })),
+              message:
+                'Ask which one category they prefer. One short question; no long lists.',
+            }),
+          ),
         );
         break;
       }
@@ -712,12 +735,12 @@ export class VoiceBrain {
         );
         this.provider.sendToolResult(
           call.callId,
-          JSON.stringify({
-            ok: true,
-            ...snapshot,
-            message:
-              'Acknowledge the preference with a soft bridge, then ask the constraint card (walking / early start / queues). Do not jump straight into full itinerary.',
-          }),
+          JSON.stringify(
+            slimTravelResult(snapshot, {
+              message:
+                'Acknowledge preference in one short line, then ask constraint card.',
+            }),
+          ),
         );
         break;
       }
@@ -736,12 +759,12 @@ export class VoiceBrain {
         );
         this.provider.sendToolResult(
           call.callId,
-          JSON.stringify({
-            ok: true,
-            ...snapshot,
-            message:
-              'Confirm constraints softly, then offer exactly one next aspect. Use softBridge wording; never hard-stop the conversation.',
-          }),
+          JSON.stringify(
+            slimTravelResult(snapshot, {
+              message:
+                'Confirm constraints briefly, then offer one next aspect.',
+            }),
+          ),
         );
         break;
       }
@@ -755,7 +778,18 @@ export class VoiceBrain {
           break;
         }
         let snippets: string[] = [];
-        if (call.args.with_search !== false) {
+        const bookableLike =
+          /ticket|accommodation|门票|票务|买票|订票|预约|预订|雪票|住宿|酒店|民宿|ski/i.test(
+            aspect,
+          ) ||
+          /(门票|买票|订票|预约|预订|雪票|展览票|演出票|乐园|住宿|酒店|民宿|住哪|帮我订)/.test(
+            this.lastUserText || '',
+          );
+        // Tickets + hotels: catalog/generic links only — never GUI booking loops.
+        const shouldSearch =
+          call.args.with_search === true ||
+          (call.args.with_search !== false && !bookableLike);
+        if (shouldSearch) {
           const plan = travelPlanner.getSnapshot();
           const query = buildTravelSearchQuery(
             plan.framework,
@@ -783,13 +817,16 @@ export class VoiceBrain {
         }
         this.provider.sendToolResult(
           call.callId,
-          JSON.stringify({
-            ok: true,
-            ...snapshot,
-            searchSnippets: snippets,
-            message:
-              'Speak the concrete 可执行选项 from speakHint (named places/areas). Do NOT re-ask travel preference. Vary wording; do not copy the previous sentence. Soft-bridge once, then stop or offer one next aspect.',
-          }),
+          JSON.stringify(
+            slimTravelResult(snapshot, {
+              latestAspect: latest
+                ? { aspect: latest.aspect, summary: latest.summary }
+                : null,
+              message: bookableLike
+                ? 'Speak 2-3 option names briefly; say links are in the notes. No GUI. Soft-bridge once.'
+                : 'Speak Day plan / options briefly from speakHint. Do not re-ask preference.',
+            }),
+          ),
         );
         break;
       }
@@ -813,11 +850,11 @@ export class VoiceBrain {
           JSON.stringify({
             ok: search.ok,
             query: search.query,
-            hits: search.hits,
+            hits: search.hits.slice(0, 3),
             error: search.error,
-            plan: travelPlanner.getSnapshot(),
+            phase: travelPlanner.getSnapshot().phase,
             message:
-              'Use hits as research hints only. Ask proactive clarifying questions for missing framework slots or preferences until the user is satisfied. Do not invent exact live ticket prices.',
+              'Use hits as short hints only. Do not invent live prices. Speak briefly.',
           }),
         );
         break;
@@ -831,12 +868,12 @@ export class VoiceBrain {
         );
         this.provider.sendToolResult(
           call.callId,
-          JSON.stringify({
-            ok: true,
-            ...snapshot,
-            message:
-              'Use soft closing language. Offer travel_finalize_plan if the user wants a desktop summary txt.',
-          }),
+          JSON.stringify(
+            slimTravelResult(snapshot, {
+              message:
+                'Soft close in one sentence. Offer travel_finalize_plan if they want the desktop txt.',
+            }),
+          ),
         );
         break;
       }
@@ -845,15 +882,18 @@ export class VoiceBrain {
           const plan = travelPlanner.getSnapshot();
           const written = await writeTravelPlanDesktopTxt(plan);
           const snapshot = travelPlanner.markFinalized(written.desktopPath);
+          const fileName =
+            written.desktopPath.split(/[/\\]/).pop() || written.desktopPath;
           this.provider.sendToolResult(
             call.callId,
             JSON.stringify({
               ok: true,
-              ...snapshot,
+              phase: snapshot.phase,
               desktopPath: written.desktopPath,
-              memoPath: written.memoPath,
+              fileName,
+              speakHint: snapshot.speakHint,
               message:
-                'Tell the user the desktop txt is open with a clear summary. Invite them to add more later softly.',
+                'ONLY say: the styled travel plan page is ready on the desktop; open it in the browser to review. One or two short sentences. Do NOT read any plan content aloud.',
             }),
           );
         } catch (error) {

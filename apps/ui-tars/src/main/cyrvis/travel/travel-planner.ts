@@ -2,6 +2,12 @@
  * Copyright (c) 2025 Bytedance, Inc. and its affiliates.
  * SPDX-License-Identifier: Apache-2.0
  */
+import {
+  buildDayPlanFromCatalog,
+  formatCatalogOption,
+  isSkiOriented,
+  resolveBookableOptions,
+} from './travel-catalog';
 
 export type TravelPhase =
   | 'idle'
@@ -145,10 +151,16 @@ const clean = (value: unknown): string | undefined => {
 export const isTravelPlanningText = (text: string): boolean => {
   const raw = text.trim();
   if (!raw) return false;
-  return /(旅行|旅游|出行|攻略|行程|机票|酒店|签证|度假|去.+玩|飞.+去|帮我(安排|规划).*(旅|行|票|酒店))/.test(
+  return /(旅行|旅游|出行|攻略|行程|机票|酒店|签证|度假|滑雪|雪场|雪票|缆车|索道|门票|预约|买票|订票|预订|去.+玩|飞.+去|帮我(安排|规划|预订|订).*(旅|行|票|酒店|滑雪))/.test(
     raw,
   );
 };
+
+/** Any reservation / ticketing intent that should skip preference probing. */
+export const isTicketFirstIntent = (text: string): boolean =>
+  /(门票|买票|订票|预订|预约|订座|订位|雪票|缆车票|索道|展览票|演出票|乐园票|门票预约|帮我订|tickets?|reservations?)/i.test(
+    text.trim(),
+  );
 
 /** True when the user clearly wants desktop GUI booking, not planning chat. */
 export const isExplicitTravelGuiRequest = (text: string): boolean =>
@@ -211,10 +223,40 @@ export const parseTravelInterest = (raw: string): TravelInterest | null => {
   if (/(经典|必去|名胜|博物馆|地标|landmark|景点)/.test(text)) {
     return 'landmark';
   }
-  if (/(体验|特色|市集| quant|演出|夜游|experience|local)/.test(text)) {
+  if (
+    /(体验|特色|市集|workshop|演出|夜游|滑雪|雪场|experience|local)/.test(text)
+  ) {
     return 'experience';
   }
   return null;
+};
+
+/** User chose a preference — ignore multi-option probe menus. */
+export const parseUserTravelInterest = (raw: string): TravelInterest | null => {
+  const text = raw.trim();
+  if (!text) return null;
+  // Assistant-style menus listing several categories are not a choice.
+  if (
+    /(想主打哪一类|哪一类|美食[、,，].*(打卡|经典|体验)|打卡[、,，].*(经典|体验|美食))/.test(
+      text,
+    )
+  ) {
+    return null;
+  }
+  // Prefer explicit choice phrasing when present.
+  if (/(更?喜欢|主打|选定?|要|选).{0,8}(美食|吃饭|餐厅)/.test(text)) {
+    return 'food';
+  }
+  if (/(更?喜欢|主打|选定?|要|选).{0,8}(网红|打卡|拍照|出片)/.test(text)) {
+    return 'checkin';
+  }
+  if (/(更?喜欢|主打|选定?|要|选).{0,8}(经典|必去|地标|博物馆)/.test(text)) {
+    return 'landmark';
+  }
+  if (/(更?喜欢|主打|选定?|要|选).{0,8}(体验|特色|滑雪|雪场)/.test(text)) {
+    return 'experience';
+  }
+  return parseTravelInterest(text);
 };
 
 /** Preferred expansion order once an interest is known. */
@@ -343,6 +385,18 @@ export class TravelPlanner {
         this.framework.purpose = interestLabel(earlyInterest);
       }
     }
+    if (
+      !this.primaryInterest &&
+      isTicketFirstIntent(clean(input.userText) || '')
+    ) {
+      const raw = clean(input.userText) || '';
+      this.primaryInterest = isSkiOriented(raw) ? 'experience' : 'landmark';
+      this.framework.purpose ||= isSkiOriented(raw)
+        ? '滑雪'
+        : /(酒店|住宿|民宿|住哪)/.test(raw)
+          ? '住宿预订'
+          : '预约订票';
+    }
 
     const missing = this.getMissingFramework();
     if (missing.length === 0) {
@@ -351,6 +405,13 @@ export class TravelPlanner {
         this.phase === 'idle' ||
         this.phase === 'skeleton_ready'
       ) {
+        const ticketFirst = isTicketFirstIntent(clean(input.userText) || '');
+        if (ticketFirst) {
+          this.ensureReadyToExpand(clean(input.userText));
+          return this.getSnapshot(
+            `${this.buildSkeleton()}。你这次更像是先订票。请直接调用 travel_expand_aspect（aspect=tickets，with_search=false），用候选库给出 2～3 个可执行票务选项，不要开浏览器找链接，也不要再跑 travel_probe_highlights。`,
+          );
+        }
         this.phase = 'probing_preferences';
       }
       return this.getSnapshot(
@@ -526,15 +587,83 @@ export class TravelPlanner {
   }
 
   /**
-   * Sync preference/constraints from recent chat so we do not re-ask questions
-   * the user already answered in natural language.
+   * Short resume blurb for launch/activate greetings — headline + up to 2
+   * concrete detail sentences. Returns null when there is nothing to resume.
    */
-  syncFromConversation(recentTurns: string[] = []): void {
-    const blob = recentTurns.join(' ');
+  buildResumeOverview(): { headline: string; details: string[] } | null {
+    const destination = this.framework.destination;
+    if (
+      !destination &&
+      this.phase === 'idle' &&
+      !this.aspects.length &&
+      !this.primaryInterest
+    ) {
+      return null;
+    }
+    const dest = destination || '目的地';
+    const headline = `上次我们一起在做去${dest}的旅行计划`;
+    const details: string[] = [];
+    const skeleton = this.buildSkeleton();
+    if (skeleton) {
+      details.push(`当时定的框架是${skeleton.replace(/^骨架攻略：/, '')}`);
+    } else if (destination) {
+      const bits = [
+        this.framework.origin ? `从${this.framework.origin}出发` : null,
+        this.framework.startDate || this.framework.endDate
+          ? [this.framework.startDate, this.framework.endDate]
+              .filter(Boolean)
+              .join('到')
+          : null,
+        this.framework.companions || null,
+      ].filter(Boolean);
+      if (bits.length) {
+        details.push(`已经摸到的信息有：${bits.join('，')}`);
+      }
+    }
+    if (this.primaryInterest) {
+      const done = this.aspects
+        .map((item) => aspectLabel(item.aspect))
+        .slice(0, 2);
+      const remaining = preferredAspectOrder(this.primaryInterest)
+        .filter(
+          (aspect) => !this.aspects.some((item) => item.aspect === aspect),
+        )
+        .slice(0, 2)
+        .map((aspect) => aspectLabel(aspect));
+      if (done.length) {
+        details.push(
+          `偏好按「${interestLabel(this.primaryInterest)}」走，已有${done.join('、')}${
+            remaining.length ? `，还差${remaining.join('、')}` : ''
+          }`,
+        );
+      } else {
+        details.push(
+          `偏好按「${interestLabel(this.primaryInterest)}」记着，住宿和行程还可以继续补`,
+        );
+      }
+    } else if (
+      this.phase === 'probing_preferences' ||
+      this.phase === 'collecting_constraints' ||
+      this.phase === 'skeleton_ready'
+    ) {
+      details.push('基础框架有了，偏好和可执行推荐还没完全展开');
+    } else if (this.phase === 'collecting_framework') {
+      details.push('目的地和时间还在收齐，具体方案还没铺开');
+    }
+    return { headline, details: details.slice(0, 2) };
+  }
+
+  /**
+   * Sync preference/constraints from recent USER chat only — never from the
+   * assistant's highlight menus (e.g. “美食、网红打卡…”), which would falsely
+   * lock preference before the user chooses.
+   */
+  syncFromConversation(recentUserTurns: string[] = []): void {
+    const blob = recentUserTurns.join(' ');
     if (!this.primaryInterest) {
       const found =
-        parseTravelInterest(blob) ||
-        parseTravelInterest(this.framework.purpose || '');
+        parseUserTravelInterest(blob) ||
+        parseUserTravelInterest(this.framework.purpose || '');
       if (found) {
         this.primaryInterest = found;
         this.framework.purpose ||= interestLabel(found);
@@ -569,6 +698,7 @@ export class TravelPlanner {
       };
     }
     if (
+      this.phase === 'collecting_framework' ||
       this.phase === 'probing_preferences' ||
       this.phase === 'collecting_constraints' ||
       this.phase === 'skeleton_ready'
@@ -641,9 +771,13 @@ export class TravelPlanner {
 
   markFinalized(desktopPath: string): TravelPlanSnapshot {
     this.phase = 'done';
-    return this.getSnapshot(
-      `${softBridgePhrase('done')}${softBridgePhrase('memo')}桌面摘要已打开：${desktopPath}`,
+    const fileName = desktopPath.split(/[/\\]/).pop() || desktopPath;
+    const snapshot = this.getSnapshot(
+      `旅行计划网页已做好，放在桌面上了，文件名是「${fileName}」，用浏览器打开就能看排版好的计划。`,
     );
+    // Stop travel idle prompts from hijacking unrelated silence after finalize.
+    this.phase = 'idle';
+    return snapshot;
   }
 
   noteSearch(query: string): void {
@@ -651,10 +785,28 @@ export class TravelPlanner {
     if (this.phase === 'idle') this.phase = 'collecting_framework';
   }
 
-  buildIdleSuggestion(recentTurns: string[]): string | null {
+  /**
+   * @param recentUserTurns recent USER utterances only (not assistant lines).
+   */
+  buildIdleSuggestion(recentUserTurns: string[]): string | null {
     if (this.phase === 'idle') return null;
-    this.syncFromConversation(recentTurns);
-    const latestUser = [...recentTurns].reverse().find(Boolean) || '';
+    this.syncFromConversation(recentUserTurns);
+    const latestUser = [...recentUserTurns].reverse().find(Boolean) || '';
+
+    if (this.phase === 'done') {
+      // After soft pause: only keep nudging if user is still in travel chat.
+      if (
+        !isTravelPlanningText(latestUser) &&
+        !/(计划文件|桌面|摘要|继续补|再加|行程|住宿)/.test(latestUser)
+      ) {
+        this.phase = 'idle';
+        return null;
+      }
+      return this.dedupeIdle(
+        '计划已经有一版了。要桌面网页摘要，还是再加一个吃饭/打卡点？',
+      );
+    }
+
     const askedAspect = this.parseAspect(latestUser);
 
     // If user already moved to a concrete section, never re-ask preference.
@@ -728,11 +880,6 @@ export class TravelPlanner {
     if (this.phase === 'expanding' && this.currentAspect) {
       return this.dedupeIdle(
         `我继续把${aspectLabel(this.currentAspect)}补成可执行选项，还是先停在这版？`,
-      );
-    }
-    if (this.phase === 'done') {
-      return this.dedupeIdle(
-        '计划已经有一版了。要桌面摘要，还是再加一个吃饭/打卡点？',
       );
     }
     return null;
@@ -852,7 +999,12 @@ export class TravelPlanner {
     ) {
       return 'daily_itinerary';
     }
-    if (/(门票|预约|票务|tickets)/.test(text) || text === 'tickets') {
+    if (
+      /(门票|预约|票务|买票|订票|雪票|缆车|索道|预订.*票|滑雪.*票|tickets)/.test(
+        text,
+      ) ||
+      text === 'tickets'
+    ) {
       return 'tickets';
     }
     if (
@@ -879,7 +1031,7 @@ export class TravelPlanner {
     const picked = interest
       ? this.highlights.find((item) => item.interest === interest)
       : undefined;
-    const places = this.pickConcretePlaces(snippets, aspect);
+    const places = this.pickConcretePlaces(snippets, aspect, notes);
     const placeLine =
       places.length > 0
         ? `可执行选项：${places.map((place, index) => `${index + 1}) ${place}`).join('；')}`
@@ -891,14 +1043,25 @@ export class TravelPlanner {
       this.constraints.okWithEarlyStart === false ? '出发偏晚、不赶早。' : '';
     const walk =
       this.constraints.okWithWalking === false ? '少步行、优先地铁直达。' : '';
+    const ski = isSkiOriented(
+      `${f.destination || ''} ${f.purpose || ''} ${notes || ''}`,
+    );
 
     switch (aspect) {
       case 'accommodation':
-        return `${aspectLabel(aspect)}：${constraintLead}${pace}${walk}围绕「${interestText || '行程'}」${picked ? `靠近 ${picked.title}` : '靠近主活动区'}。${placeLine}。预算按${f.budget || '你的预算'}控制；${noteText || '建议先订可免费取消的房型。'} 你选一个，我再帮你补周边吃饭点。`;
-      case 'daily_itinerary':
-        return `${aspectLabel(aspect)}：${constraintLead}${pace}${walk}${f.startDate || '出发日'}到${f.endDate || '返程日'}，每天只排 1 个主目标+1 个备份。${placeLine}。${interest === 'food' ? '正餐优先钉死，景点穿插。' : interest === 'checkin' ? '先打卡再补经典点。' : '同区域串联，少折返。'}${noteText || ''} 你点头哪个，我就按那个排当天路线。`;
+        return `${aspectLabel(aspect)}：${constraintLead}${pace}${walk}围绕「${interestText || (ski ? '滑雪' : '行程')}」${picked ? `靠近 ${picked.title}` : '靠近主活动区'}。酒店/民宿也只给预订链接，不代你下单、不开浏览器点订。${placeLine}。预算按${f.budget || '你的预算'}控制；${noteText || '优先可免费取消。'} 你选一个，我写进笔记；你自己点开链接下单即可。`;
+      case 'daily_itinerary': {
+        const dayPlan = buildDayPlanFromCatalog({
+          destination: f.destination,
+          interest,
+          userText: `${f.purpose || ''} ${notes || ''}`,
+          preferLateStart: this.constraints.okWithEarlyStart === false,
+          dayCount: 2,
+        });
+        return `${aspectLabel(aspect)}：${constraintLead}${pace}${walk}${f.startDate || '出发日'}到${f.endDate || '返程日'}。按天草案：${dayPlan}。${placeLine}。${noteText || ''} 你点头哪一天的主线，或说“就按 Day1”，我就锁定。`;
+      }
       case 'tickets':
-        return `${aspectLabel(aspect)}：${constraintLead}${this.constraints.okWithQueues === false ? '优先可预约/快速通道。' : ''}${placeLine}。先把必去的预约窗口定掉；${noteText || '不确定的先加入待订清单。'}`;
+        return `${aspectLabel(aspect)}：${constraintLead}${this.constraints.okWithQueues === false ? '优先可预约/快速通道。' : ''}所有需要预约或订票的项目，我都只给方案和网址，不代你下单、也不开浏览器点来点去。${placeLine}。${noteText || '选一个，我写进待订清单和最终笔记；你自己点开链接完成支付即可。'}`;
       case 'budget_booking':
         return `${aspectLabel(aspect)}：总预算${f.budget || '待定'}。建议今天就定：大交通+住宿；给「${interestText || '主线'}」留弹性。${placeLine}。${noteText || ''}`;
       case 'emergency':
@@ -911,7 +1074,19 @@ export class TravelPlanner {
   private pickConcretePlaces(
     snippets: string[],
     aspect: TravelAspect,
+    notes?: string,
   ): string[] {
+    const fromCatalog = resolveBookableOptions({
+      destination: this.framework.destination,
+      aspect,
+      interest: this.primaryInterest,
+      userText: `${this.framework.purpose || ''} ${notes || ''}`,
+      preferLateStart: this.constraints.okWithEarlyStart === false,
+      limit: 3,
+    }).map(formatCatalogOption);
+    if (fromCatalog.length) return fromCatalog;
+
+    // Snippets are secondary: Instant Answer is often empty for CN booking.
     const fromSnippets = snippets
       .map((item) => item.replace(/\s+/g, ' ').trim())
       .filter(Boolean)
@@ -994,16 +1169,25 @@ export class TravelPlanner {
     if (!text) return;
 
     if (!this.framework.destination) {
+      const known =
+        text.match(/(崇礼|太舞|云顶|张家口|巴黎|东京|大阪|京都|首尔)/)?.[1] ||
+        null;
       const dest =
+        known ||
         text.match(
-          /去(?:一趟|玩玩|旅游|旅行)?([\u4e00-\u9fa5A-Za-z]{2,12}?)(?:的|玩|旅游|旅行|机票|酒店|吗|呢|吧|$)/,
+          /去(?:一趟|玩玩|旅游|旅行)?([\u4e00-\u9fa5A-Za-z]{2,12}?)(?:的|玩|旅游|旅行|机票|酒店|滑雪|吗|呢|吧|$)/,
         )?.[1] ||
         text.match(
-          /到([\u4e00-\u9fa5A-Za-z]{2,12}?)(?:玩|旅游|旅行|的|机票|酒店|$)/,
+          /到([\u4e00-\u9fa5A-Za-z]{2,12}?)(?:玩|旅游|旅行|的|机票|酒店|滑雪|$)/,
         )?.[1];
       if (dest && !/(哪里|哪儿|酒店|机票)/.test(dest)) {
         this.framework.destination = dest;
+      } else if (isSkiOriented(text)) {
+        this.framework.destination = '崇礼';
       }
+    }
+    if (!this.framework.purpose && isSkiOriented(text)) {
+      this.framework.purpose = '滑雪';
     }
 
     if (!this.framework.origin) {

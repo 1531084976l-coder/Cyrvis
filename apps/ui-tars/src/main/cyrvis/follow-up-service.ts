@@ -136,16 +136,129 @@ const compactTopic = (text: string): string => {
   return normalized.length > 34 ? `${normalized.slice(0, 32)}……` : normalized;
 };
 
+const clipDetail = (text: string, max = 48): string => {
+  const normalized = text.replace(/\s+/g, ' ').trim();
+  if (normalized.length <= max) return normalized;
+  return `${normalized.slice(0, max - 1)}…`;
+};
+
+/** Soft-fill planner from memory after restart (in-memory state is empty). */
+const rehydrateTravelFromMemory = (memory: CyrvisMemorySnapshot): void => {
+  const snap = travelPlanner.getSnapshot();
+  if (snap.framework.destination) return;
+
+  const texts = [
+    ...memory.facts.slice(0, 12),
+    ...memory.turns.slice(-24).map((turn) => turn.text),
+  ];
+  for (const text of [...texts].reverse()) {
+    const skeleton = text.match(/骨架攻略：([^。\n]+)/)?.[1];
+    if (skeleton) {
+      travelPlanner.updateFramework({ userText: skeleton });
+      if (travelPlanner.getSnapshot().framework.destination) break;
+    }
+    const dest =
+      text.match(
+        /去(?:一趟|玩玩|旅游|旅行)?([\u4e00-\u9fa5A-Za-z]{2,12}?)(?:的|玩|旅游|旅行|机票|酒店|滑雪)/,
+      )?.[1] ||
+      text.match(/出发去([\u4e00-\u9fa5A-Za-z]{2,12})/)?.[1] ||
+      text.match(/CYRVIS旅行计划-([\u4e00-\u9fa5A-Za-z]{2,12})/)?.[1];
+    if (dest) {
+      travelPlanner.updateFramework({
+        destination: dest,
+        userText: text.slice(0, 120),
+      });
+      break;
+    }
+  }
+
+  const preferenceBlob = memory.turns
+    .filter((turn) => turn.role === 'user')
+    .slice(-8)
+    .map((turn) => turn.text)
+    .join(' ');
+  travelPlanner.syncFromConversation([preferenceBlob]);
+};
+
+const buildResumeFromMemoryFallback = (
+  memory: CyrvisMemorySnapshot,
+): string | null => {
+  const recentUser = [...memory.turns]
+    .reverse()
+    .find((turn) => turn.role === 'user');
+  const recentAssistant = [...memory.turns]
+    .reverse()
+    .find((turn) => turn.role === 'assistant');
+  const recentTask = [...memory.activities]
+    .reverse()
+    .find(
+      (item) =>
+        item.kind === 'task' ||
+        /启动电脑任务|旅行|行程|计划|任务/.test(item.text),
+    );
+
+  if (!recentUser && !recentTask) return null;
+
+  const topic = compactTopic(
+    recentTask?.text.replace(/^启动电脑任务：/, '') ||
+      recentUser?.text ||
+      '上一个任务',
+  );
+  const details: string[] = [];
+  if (recentAssistant?.text) {
+    details.push(`上次聊到：${clipDetail(recentAssistant.text)}`);
+  }
+  if (recentUser?.text && recentUser.text !== topic) {
+    details.push(`你那边主要在说：${clipDetail(recentUser.text)}`);
+  }
+  if (!details.length && recentTask?.text) {
+    details.push(`相关活动是：${clipDetail(recentTask.text)}`);
+  }
+  if (!details.length) {
+    details.push('当时还没完全收尾，细节还可以接着补');
+  }
+
+  const body = details.slice(0, 2).join('。');
+  return `上次我们一起在做「${topic}」。${body}。需要继续完善这个任务吗？`;
+};
+
+/** Launch/activate/resume: summarize last task instead of a bare continue ask. */
+const buildLifecycleResumeInvite = (memory: CyrvisMemorySnapshot): string => {
+  const recentUserTurns = memory.turns
+    .filter((turn) => turn.role === 'user')
+    .slice(-8)
+    .map((turn) => turn.text.trim())
+    .filter(Boolean);
+  travelPlanner.syncFromConversation(recentUserTurns);
+  rehydrateTravelFromMemory(memory);
+
+  const overview = travelPlanner.buildResumeOverview();
+  if (overview) {
+    const detailText =
+      overview.details.length > 0
+        ? `${overview.details.join('。')}。`
+        : '框架和偏好还记得一部分，具体方案还可以接着补。';
+    return `${overview.headline}。${detailText}需要继续完善这个任务吗？`;
+  }
+
+  return (
+    buildResumeFromMemoryFallback(memory) ||
+    '上次的事情还留着一点尾巴。需要继续完善这个任务吗？'
+  );
+};
+
 const buildContextualSuggestion = (
   memory: CyrvisMemorySnapshot,
   previous: string,
 ): string => {
-  const recentTurns = memory.turns
+  // Only USER turns — assistant menus like “美食、打卡…” must not lock preference.
+  const recentUserTurns = memory.turns
+    .filter((turn) => turn.role === 'user')
     .slice(-6)
     .map((turn) => turn.text.trim())
     .filter(Boolean);
-  travelPlanner.syncFromConversation(recentTurns);
-  const travelHint = travelPlanner.buildIdleSuggestion(recentTurns);
+  travelPlanner.syncFromConversation(recentUserTurns);
+  const travelHint = travelPlanner.buildIdleSuggestion(recentUserTurns);
   if (travelHint) {
     // Never emit a near-duplicate idle prompt.
     const norm = (text: string) => text.replace(/\s+/g, '');
@@ -288,6 +401,13 @@ let lastIdleSourceAt = 0;
 let idleCheckRunning = false;
 
 const speakLocally = (text: string): void => {
+  // macOS fallback only — Windows uses the realtime voice session.
+  if (process.platform !== 'darwin') {
+    logger.warn(
+      '[cyrvis follow-up] local TTS skipped on this platform; showing text only',
+    );
+    return;
+  }
   localSpeechProcess?.kill();
   localSpeechProcess = execFile(
     '/usr/bin/say',
@@ -336,21 +456,25 @@ const enrichAndSpeak = async (prompt: FollowUpPrompt): Promise<void> => {
     prompt.reason === 'idle'
       ? buildContextualSuggestion(memory, previousGreeting)
       : createGreeting(now, yesterdayItems >= 8, previousGreeting);
+  const resumeInvite =
+    prompt.reason === 'idle' ? '' : buildLifecycleResumeInvite(memory);
+  // Lifecycle speech = short hello + task summary + continue ask (not bare).
+  const speech =
+    prompt.reason === 'idle' ? greeting : `${greeting}${resumeInvite}`;
 
   const enriched = {
     ...prompt,
-    greeting,
+    greeting: speech,
   };
   followUpStore.set({
     ...followUpStore.store,
-    lastGreeting: greeting,
+    lastGreeting: speech,
     pending: enriched,
   });
 
-  const action = prompt.reason === 'idle' ? '' : '要继续上次的任务吗？';
-  const speech = `${enriched.greeting}${action}`;
+  // Always mirror proactive lines into the transcript/memory.
+  publishProactiveText(speech);
   if (!speakProactiveText(speech)) {
-    publishProactiveText(speech);
     speakLocally(speech);
   }
   followUpStore.set('pending', null);

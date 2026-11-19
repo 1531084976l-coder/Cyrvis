@@ -207,7 +207,7 @@ export const CYRVIS_VOICE_TOOLS: QwenToolDefinition[] = [
     function: {
       name: 'travel_expand_aspect',
       description:
-        'Expand one travel aspect with 2-3 concrete executable recommendations (named places/areas). Use when user asks for 住宿/行程/门票 even if preference was only said in chat. Do NOT bounce back to preference questions. Soft handoff; no abrupt stop.',
+        'Expand one travel aspect with 2-3 concrete options + URLs (any destination). For 门票/预约/订票 AND 住宿/酒店/民宿 set with_search=false and only speak/write booking links—never GUI-book. For 行程 include Day1/Day2 draft. Soft handoff.',
       parameters: {
         type: 'object',
         properties: {
@@ -257,7 +257,7 @@ export const CYRVIS_VOICE_TOOLS: QwenToolDefinition[] = [
     function: {
       name: 'travel_finalize_plan',
       description:
-        'When the travel plan is settled enough, write a Chinese summary memo and create+open a desktop .txt so the user can read the result directly.',
+        'Write+open a styled desktop HTML travel plan page. After success, only tell the user the page is ready on the desktop—never read the full plan aloud.',
       parameters: { type: 'object', properties: {}, required: [] },
     },
   },
